@@ -564,15 +564,16 @@ type Engine struct {
 	// TCC-protected locations. homeDir is empty when the home directory
 	// cannot be resolved, which disables the gate rather than guessing.
 	// goos mirrors runtime.GOOS so the gate is testable off-darwin.
-	scanProtectedPaths bool
-	homeDir            string
-	goos               string
-	syncMu             gosync.Mutex // serializes all sync operations
-	mu                 gosync.RWMutex
-	lastSync           time.Time
-	lastSyncStats      SyncStats
-	currentProgress    *Progress
-	progressStallAfter time.Duration
+	scanProtectedPaths  bool
+	homeDir             string
+	goos                string
+	subagentLinkPending bool         // protected by syncMu; retains failed global linking
+	syncMu              gosync.Mutex // serializes all sync operations
+	mu                  gosync.RWMutex
+	lastSync            time.Time
+	lastSyncStats       SyncStats
+	currentProgress     *Progress
+	progressStallAfter  time.Duration
 	// skipCache tracks paths that should be skipped on
 	// subsequent syncs, keyed by path with the file mtime
 	// at time of caching. Covers parse errors and
@@ -581,6 +582,8 @@ type Engine struct {
 	// in-memory source fingerprint when one is available.
 	skipMu    gosync.RWMutex
 	skipCache map[string]int64
+
+	sourceFailures sourceFailureCache
 	// skipCacheDirty is protected by skipMu and cleared only for a persistence attempt.
 	skipCacheDirty   bool
 	skipFingerprints map[string]string
@@ -1774,11 +1777,24 @@ func (e *Engine) applyChangedPathSyncLocked(
 		Detail:        "Syncing changed session paths",
 		SessionsTotal: len(prepared.files),
 	})
-	results := e.startWorkers(ctx, prepared.files)
-	stats := e.collectAndBatch(
-		ctx, results, len(prepared.files), len(prepared.files), nil,
-		syncWriteDefault,
+	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	results := e.startWorkers(processingCtx, prepared.files)
+	affectedSessionIDs := make(changedSessionLinks)
+	stats := e.collectAndBatchWithOptions(
+		processingCtx, results, len(prepared.files), len(prepared.files), nil,
+		syncWriteDefault, collectAndBatchOptions{
+			observeResult: func(job syncJob) {
+				affectedSessionIDs.observe(job, e.idPrefix)
+			},
+		},
 	)
+	var linkErr error
+	if !stats.Aborted {
+		linkErr = affectedSessionIDs.link(e)
+		if linkErr != nil {
+			stats.RecordFailed()
+		}
+	}
 	e.anomalies.applyTo(&stats)
 	e.persistSkipCache()
 	complete := prepared.classificationErr == nil && ctx.Err() == nil &&
@@ -1810,7 +1826,7 @@ func (e *Engine) applyChangedPathSyncLocked(
 	if stats.Synced > 0 {
 		log.Printf("sync: %d file(s) updated", stats.Synced)
 	}
-	if err := errors.Join(prepared.classificationErr, ctx.Err()); err != nil {
+	if err := errors.Join(prepared.classificationErr, linkErr, ctx.Err()); err != nil {
 		if stats.Deferred > 0 {
 			return stats, tombstoned, &incompleteReconciliationError{
 				deferred: stats.Deferred,
@@ -5395,8 +5411,9 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 	// group instead, consuming the eligibility recorded here; tombstoning
 	// below then proceeds without the linking gate, which is safe because
 	// linking is idempotent and retried on the caller's next pass.
+	e.subagentLinkPending = e.subagentLinkPending || stats.hasSessionChanges()
 	if retErr == nil && stats.Failed == 0 && !stats.Aborted {
-		eligibility.link = true
+		eligibility.link = fullCoverage || e.subagentLinkPending
 	}
 	if eligibility.link && !passEpilogueDeferred(ctx) {
 		// Batch-level linking was deferred to this global pass, so run it
@@ -10210,7 +10227,9 @@ func (e *Engine) collectAndBatchWithOptions(
 			if r.cacheSkip && r.mtime != 0 && !r.noCacheSkip {
 				e.cacheSkip(r.skipCacheKey(), r.mtime, r.sourceFingerprint)
 			}
-			log.Printf("sync error: %v", r.err)
+			if !r.cachedFailure {
+				log.Printf("sync error: %v", r.err)
+			}
 			r.releaseAll()
 			continue
 		}
@@ -10863,7 +10882,9 @@ func (e *Engine) linkSubagentSessions(ctx context.Context) error {
 	if runtimeMetrics := reconciliationRuntimeMetricsFor(ctx); runtimeMetrics != nil {
 		runtimeMetrics.globalLinkPass()
 	}
-	return e.db.LinkSubagentSessionsContext(ctx)
+	err := e.db.LinkSubagentSessionsContext(ctx)
+	e.subagentLinkPending = err != nil
+	return err
 }
 
 // drainResults consumes remaining items from the results
@@ -11025,8 +11046,9 @@ type processResult struct {
 	// transient: a readability fix or completed record may retain the same file
 	// mtime, so caching either result would silently skip later work instead of
 	// retrying it.
-	noCacheSkip bool
-	needsRetry  bool
+	noCacheSkip   bool
+	cachedFailure bool // retain failure status without repeating the detailed log
+	needsRetry    bool
 	// forceReplace requests full message replacement on write,
 	// even when the existing rows would otherwise be left in
 	// place. Set when a fall-through to full parse is recovering
@@ -11524,6 +11546,12 @@ func (e *Engine) processProviderFile(
 		}
 	}
 
+	if !forceSourceCwdParse {
+		if err := e.cachedProviderFailure(file, source, preParseStatHash, nil); err != nil {
+			return processResult{err: err, noCacheSkip: true, cachedFailure: true}, true
+		}
+	}
+
 	// Persisted stat-digest skip. This runs before the single-session
 	// content guard below on purpose: a matching digest (size, mtime,
 	// ctime per component) plus a current stored row proves the source
@@ -11722,7 +11750,15 @@ func (e *Engine) processProviderFile(
 					forceReplace:       true,
 				}, true
 			}
+			if ctx.Err() == nil {
+				e.cacheProviderFailure(file, source, preParseStatHash, nil, err)
+			}
 			return processResult{err: err}, true
+		}
+	}
+	if !forceSourceCwdParse {
+		if err := e.cachedProviderFailure(file, source, preParseStatHash, &fingerprint); err != nil {
+			return processResult{err: err, noCacheSkip: true, cachedFailure: true}, true
 		}
 	}
 	cacheKey := providerProcessCacheKey(
@@ -12003,6 +12039,9 @@ func (e *Engine) processProviderFile(
 		})
 	}
 	if err != nil {
+		if ctx.Err() == nil {
+			e.cacheProviderFailure(file, source, preParseStatHash, &fingerprint, err)
+		}
 		if stagedSink != nil {
 			stagedSink.Close()
 		}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -259,13 +260,23 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 			if totalRoots == 0 {
 				continue
 			}
-			log.Printf("polling %d unwatched root(s)", totalRoots)
+			var scopes []string
+			for agent, roots := range groups {
+				for _, root := range roots {
+					scopes = append(scopes, fmt.Sprintf("%s:%q", agent, root))
+				}
+			}
+			slices.Sort(scopes)
+			log.Printf("polling %d unwatched root(s): %s", totalRoots, strings.Join(scopes, ", "))
 			c.doWork(func() {
 				if c.workerCtx.Err() != nil {
 					return
 				}
+				started := c.now()
 				if err := pollUnwatchedScopesOnce(c.workerCtx, c.engine, groups); err != nil {
-					log.Printf("polling unwatched roots: %v", err)
+					log.Printf("polling unwatched roots failed after %s: %v", c.now().Sub(started), err)
+				} else {
+					log.Printf("polling unwatched roots completed in %s", c.now().Sub(started))
 				}
 			})
 			c.pollMu.Lock()

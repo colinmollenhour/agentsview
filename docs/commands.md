@@ -190,6 +190,21 @@ On startup, the server:
 The server shuts down cleanly on `Ctrl+C`, flushing the database and stopping
 file watchers.
 
+On current `main`, watcher batches link subagent relationships only for affected
+sessions. Unchanged polls skip archive-wide linking. Poll logs identify the
+provider roots being checked and report how long the pass took.
+
+Errors caused by malformed data or incompatible schemas, and files missing
+during fingerprint reads, remain failed syncs. The daemon remembers these
+failures for up to five minutes to suppress repeated parsing and detailed error
+logs. A changed source fingerprint, a newly created missing file, or an explicit
+forced parse permits an earlier retry.
+
+Providers with complete filesystem stat digests can also skip repeated content
+hashing. This bounded, process-local cache never authorizes session deletion.
+File permission errors, SQLite locks, unclassified provider errors, and archive
+write errors retry normally.
+
 #### Background Mode
 
 The existing `serve` background and lifecycle forms remain available:

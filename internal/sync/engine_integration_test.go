@@ -16360,6 +16360,15 @@ func TestSyncSingleSessionIncrementalAppendLinksSpawnedChild(t *testing.T) {
 }
 
 func TestSyncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T) {
+	for _, watcher := range []bool{false, true} {
+		t.Run(fmt.Sprintf("watcher=%t", watcher), func(t *testing.T) {
+			syncChangedPathPlanIncrementalAppendLinksSpawnedChild(t, watcher)
+		})
+	}
+}
+
+func syncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T, watcher bool) {
+	t.Helper()
 	env := setupTestEnv(t)
 	env.writeClaudeSession(
 		t, "changed-path-link", "main-changed-path.jsonl",
@@ -16407,13 +16416,15 @@ func TestSyncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T) {
 	require.NoError(t, file.Close())
 	require.NoError(t, writeErr)
 
-	plan, err := env.engine.PlanChangedPathsContext(
-		t.Context(), []string{orchestratorPath},
-	)
-	require.NoError(t, err)
-	result, err := env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
-	require.NoError(t, err)
-	assert.Equal(t, 1, result.Stats.Synced)
+	if watcher {
+		require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{orchestratorPath}))
+	} else {
+		plan, err := env.engine.PlanChangedPathsContext(t.Context(), []string{orchestratorPath})
+		require.NoError(t, err)
+		result, err := env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 1, result.Stats.Synced)
+	}
 
 	var gotFirstMessageID int64
 	require.NoError(t, env.db.Reader().QueryRow(`
@@ -16429,6 +16440,15 @@ func TestSyncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T) {
 }
 
 func TestSyncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T) {
+	for _, watcher := range []bool{false, true} {
+		t.Run(fmt.Sprintf("watcher=%t", watcher), func(t *testing.T) {
+			syncChangedPathPlanLinkFailureQueuesDurableRepair(t, watcher)
+		})
+	}
+}
+
+func syncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T, watcher bool) {
+	t.Helper()
 	env := setupTestEnv(t)
 	env.writeClaudeSession(
 		t, "changed-path-link-retry", "main-changed-path-retry.jsonl",
@@ -16482,11 +16502,14 @@ func TestSyncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T) {
 		END`)
 	require.NoError(t, err)
 
-	plan, err := env.engine.PlanChangedPathsContext(
-		t.Context(), []string{orchestratorPath},
-	)
-	require.NoError(t, err)
-	_, err = env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+	if watcher {
+		err = env.engine.SyncPathsContext(t.Context(), []string{orchestratorPath})
+	} else {
+		var plan sync.ChangedPathPlan
+		plan, err = env.engine.PlanChangedPathsContext(t.Context(), []string{orchestratorPath})
+		require.NoError(t, err)
+		_, err = env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+	}
 	require.ErrorContains(t, err, "injected changed-path link failure")
 
 	var queued int

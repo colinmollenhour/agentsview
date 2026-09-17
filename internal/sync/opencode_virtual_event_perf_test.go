@@ -16,6 +16,9 @@ import (
 )
 
 func TestOpenCodeVirtualEventDoesNotRecheckUnrelatedMembers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
 	for _, layout := range []string{"v1", "v2", "mixed"} {
 		t.Run(layout, func(t *testing.T) {
 			v2 := layout != "v1"
@@ -92,6 +95,9 @@ func TestOpenCodeVirtualEventDoesNotRecheckUnrelatedMembers(t *testing.T) {
 }
 
 func TestOpenCodeMissingSidecarWorkStaysBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
 	allocations := map[string][]float64{"-wal": {}, "-shm": {}}
 	for _, count := range []int{8, 800} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
