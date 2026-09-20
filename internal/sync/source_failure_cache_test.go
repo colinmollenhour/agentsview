@@ -135,6 +135,10 @@ type failureFingerprintProvider struct {
 	calls *atomic.Int32
 }
 
+func (p failureFingerprintProvider) WatchRoots(ctx context.Context) ([]parser.WatchRoot, error) {
+	return parser.ResolveWatchRoots(ctx, p.Provider)
+}
+
 func (p failureFingerprintProvider) Fingerprint(ctx context.Context, source parser.SourceRef) (parser.SourceFingerprint, error) {
 	p.calls.Add(1)
 	return p.Provider.Fingerprint(ctx, source)

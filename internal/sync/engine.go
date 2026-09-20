@@ -2389,6 +2389,11 @@ func providerChangedPathForceParse(
 	if mode != parser.ProviderMigrationProviderAuthoritative {
 		return true
 	}
+	// Grok requires a matching content fingerprint for all companion files.
+	// Ordinary watcher events must not clear its failed-source retry cache.
+	if agent == parser.AgentGrok {
+		return false
+	}
 	// Codebuff changed-path events must always force a fingerprint
 	// comparison. The composite stat-only freshness gate may skip
 	// same-size, same-mtime rewrites, so a concrete changed-path

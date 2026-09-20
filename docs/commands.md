@@ -200,6 +200,10 @@ failures for up to five minutes to suppress repeated parsing and detailed error
 logs. A changed source fingerprint, a newly created missing file, or an explicit
 forced parse permits an earlier retry.
 
+Grok companion-file events use normal content-fingerprint checks. Repeated
+companion removal events therefore keep missing-summary failures suppressed,
+while actual companion edits still trigger sync.
+
 Providers with complete filesystem stat digests can also skip repeated content
 hashing. This bounded, process-local cache never authorizes session deletion.
 File permission errors, SQLite locks, unclassified provider errors, and archive
