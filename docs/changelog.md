@@ -10,6 +10,10 @@ The latest published release is
 
 **New features**
 
+- Mount the writable SQLite server below a reverse-proxy URL prefix with
+  `agentsview serve --base-path`, including background serves. Keep
+  `--public-url` set to the browser origin; AgentsView adds the mount path to
+  assets, API requests, navigation, and its published browser URL.
 - Coding agents can now consult prior conversation evidence proactively when
   earlier decisions or solutions may help. `agentsview skills install`
   upgrades the existing recall skill for Claude and Agents/Codex, and Claude
@@ -195,6 +199,11 @@ The latest published release is
 - Grok child sessions appear beneath their spawning parent and count as subagent
   activity. Native Pi branches regain parent links when the parent session can
   be resolved.
+- Pi subagent sessions written by the `pi-subagents` extension now appear
+  beneath the session that started them and count as subagent activity. The
+  extension keeps each run's transcript in a subdirectory of the sessions
+  directory, which discovery previously skipped. Run `agentsview sync` to pick
+  up existing subagent sessions.
 - Older Piebald and Kilo databases import despite missing columns that
   previously caused discovery or parsing failures.
 - Cursor IDE imports accept structured tool results, including object-valued
@@ -230,6 +239,9 @@ The latest published release is
   every file they touch, one tool call per file. Startup reparses available
   Codex sessions; sessions whose sources are gone keep their archived tool
   calls.
+- Clicking the selected value in the session filter's minimum-prompts row clears
+  the filter instead of leaving it set, so it can be turned off without
+  clearing the other filters.
 
 **Acknowledgements**
 
