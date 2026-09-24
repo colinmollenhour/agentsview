@@ -86,7 +86,7 @@
     type PanelDateState,
   } from "./lib/stores/yokedDates.svelte.js";
   import { m } from "./lib/i18n/index.js";
-  import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/runtime.js";
+  import { setAuthToken, getAuthToken, setServerUrl } from "./lib/api/runtime.js";
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
   import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
@@ -747,7 +747,7 @@
     sync.checkForUpdate();
     sync.startPolling();
 
-    const healthCleanup = setupVisibilityHealthCheck(getBase, {
+    const healthCleanup = setupVisibilityHealthCheck({
       onBackendDegraded: () => sync.markBackendDegraded(),
     });
 
@@ -1080,7 +1080,7 @@
   }
 
   .auth-card-btn:disabled {
-    opacity: 0.6;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 

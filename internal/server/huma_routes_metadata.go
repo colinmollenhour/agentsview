@@ -8,10 +8,13 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/update"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerMetadataRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "Metadata")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Metadata")
 
 	s.get(group, "/projects", "List projects", s.humaListProjects)
 	s.get(group, "/machines", "List machines", s.humaListMachines)
@@ -179,7 +182,7 @@ func (s *Server) humaGetVersion(
 }
 
 func (s *Server) humaCheckUpdate(
-	_ context.Context,
+	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[updateCheckResponse], error) {
 	if s.cfg.DisableUpdateCheck {
@@ -191,9 +194,9 @@ func (s *Server) humaCheckUpdate(
 	if checkFn == nil {
 		checkFn = update.CheckForUpdate
 	}
-	info, err := checkFn(s.version.Version, false, s.dataDir)
+	info, err := checkFn(ctx, s.version.Version, false, s.dataDir)
 	if err != nil || info == nil {
-		return &jsonOutput[updateCheckResponse]{
+		return &jsonOutput[updateCheckResponse]{ //nolint:nilerr // Optional update metadata falls back to the installed version.
 			Body: updateCheckResponse{CurrentVersion: s.version.Version},
 		}, nil
 	}

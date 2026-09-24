@@ -1,7 +1,7 @@
 # Storage Rules
 
-Read this file before changing SQLite, PostgreSQL, CockroachDB, DuckDB, archive
-resync, or storage queries.
+Read this file before changing SQLite, PostgreSQL, CockroachDB, DuckDB,
+ClickHouse, archive resync, or storage queries.
 
 ## SQLite Archive
 
@@ -12,6 +12,34 @@ Use non-destructive schema migrations such as `ALTER TABLE` and `UPDATE`. A
 parser change that needs a full resync must build a fresh database, sync source
 files, copy orphaned sessions from the old database, and swap the files
 atomically. Preserve sessions even when their source files no longer exist.
+
+### Conversation export
+
+Conversation exports consume normalized SQLite message records for every agent.
+The database is the system of record: use stored content, roles, system markers,
+and source identities. Do not add agent allowlists, export-only parser fields,
+or source reparse requirements. Export metadata and message writes commit in the
+same transaction. After archive copies apply content policies, refresh the
+export index from the final stored messages while preserving their message IDs.
+Usage-only writes publish a session-level coverage gap even when policy removes
+every message.
+
+Message IDs are opaque archive identities, not row IDs, ordinals, timestamps, or
+text hashes. Preserve them through verified appends, unchanged complete
+reparses, and unambiguous native source IDs, including retained tombstones.
+Changed no-ID replacements must report identity ambiguity. Rebuilds retain these
+IDs and tombstones but use the new database generation for revisions and
+cursors.
+
+Initialize a missing conversation index from existing database messages on
+writable open. Copied orphans and trash use the same stored records; absent
+source files do not make their archived text unavailable.
+
+Keep only current bodies and compact latest changes, not a body event log.
+Project-only changes publish session invalidations without changing message
+revisions. Manifest and bounded body reads resolve project evidence in their own
+SQLite snapshot; body reads also pin the database generation and message
+revision. This local contract does not widen raw artifacts or mirror schemas.
 
 ### Codex incremental import state
 
@@ -123,6 +151,107 @@ SVG payloads stay inline. A separate serving host needs the matching
 `{dataDir}/assets` directory with the copied database content. The command
 otherwise follows the same transaction, revision, and publication sequence as
 `db strip --images`. Back up `{dataDir}/assets` together with the archive.
+
+The daemon may retain recently served canonical image bytes in a bounded
+in-process cache for up to seven days from generation. Entries can leave sooner
+when the cache reaches its entry or byte limit, and process exit clears them.
+`{dataDir}/assets` remains the durable image store and backup target. Cache
+eviction never changes it, and the browser's own cache policy is separate.
+
+## Backend Roles and Contract
+
+Adding a remote database means implementing Go interfaces, not copying the
+PostgreSQL command, config, push, and serve code. `internal/storage` names the
+three roles and holds the contract; `internal/backendcontract` asserts every
+backend at compile time, so a missing method fails `go build`.
+
+| Role    | Today                  | Contract                                   |
+| ------- | ---------------------- | ------------------------------------------ |
+| Archive | SQLite `*db.DB`        | `db.Store`; the only writable ingest store |
+| Replica | PostgreSQL, ClickHouse | `db.Store` plus `storage.Replica`          |
+| Mirror  | DuckDB                 | `db.Store` plus `storage.Mirror`           |
+
+A replica is a remote database the archive pushes into and that serves the web
+UI read-only. A replica may keep its push cursor in the archive sync state
+(PostgreSQL) or in its own metadata (ClickHouse); the contract does not care. A
+mirror is a disposable local derived file. A new remote SQL backend is a
+replica. Do not model it on DuckDB, and do not add a fourth role.
+
+### How to add a replica backend
+
+1. Create `internal/<name>` with a `Store` that implements `db.Store` with
+   `ReadOnly() bool` returning true, a `Sync` (or similar) that implements
+   `storage.Pusher`, and a `Backend` struct that implements `storage.Replica`.
+   `ValidateTarget` runs before any local work; put connection rules the
+   backend enforces up front there (ClickHouse rejects plaintext remote URLs
+   without `allow_insecure`), and return nil when there are none. Use
+   `internal/postgres/backend.go` and `internal/clickhouse/backend.go` as the
+   two worked examples. The push returns `storage.PushResult` and reports
+   progress as `storage.PushProgress`; a backend without a vector phase sets
+   `Vectors.Skipped`. Write the backend's own SQL; the contract is Go, not a
+   shared query string.
+1. Add the config section and its resolvers in `internal/config` the way
+   `[pg]`/`[pg.NAME]` and `[clickhouse]` work: a struct, `Resolve<Name>`,
+   `Resolve<Name>Target`, and `<Name>TargetNames`. `Backend.Targets` and
+   `Backend.ResolveTarget` map them onto `storage.ReplicaTargetRef` and
+   `storage.ConfiguredReplica`.
+1. Register the backend in `cmd/agentsview/backends.go` (`replicaBackends`) and
+   add the compile-time assertions in `internal/backendcontract/contract.go`.
+1. Add the CLI verb in `cmd/agentsview/cli.go` with
+   `newReplicaCommand(<name>.Backend{}, extra...)`. That gives `<name> push`,
+   `<name> push --watch`, `<name> status`, and `<name> serve` from
+   `replica.go` and `replica_watch.go` with no new command code. Backend-only
+   verbs (like `pg vectors`) are the `extra` commands. A background service
+   needs a `serviceKind` entry in `pg_service_manager.go`.
+1. Regenerate the OpenAPI document and clients with
+   `cd frontend && npm run generate:api`, then add the backend's generated
+   daemon operation to `replicaPushOperations` in
+   `cmd/agentsview/daemon_push.go`. The daemon route `/api/v1/push/<name>`
+   comes from the registry; `internal/server` needs no change.
+   `TestReplicaBackendsHaveDaemonPushOperations` fails until the entry exists.
+1. Add tests: a `Backend` unit test for target mapping (no database), the
+   backend's own tagged integration tests, and an entry in the classifier
+   wiring guard (`classifier_wiring_test.go`) if the backend opens stores
+   through a variable not named `backend`.
+
+### Vector search on a replica
+
+Semantic and hybrid search on a replica has two seams in `internal/storage`
+(`vector_search.go`), both optional:
+
+- `storage.VectorSearchProvider` on the `Backend`: `VectorGenerations` lists the
+  embedding generations the store holds, and `OpenVectorSearcher` returns a
+  `db.VectorSearcher` over the one matching the local config fingerprint, or a
+  reason when none is ready.
+- `storage.VectorSearchStore` on the `Store`: `SetVectorSearcher` and
+  `SetSemanticUnavailableReason`, which the store's semantic and hybrid
+  `SearchContent` paths read.
+
+The push side needs no new interface: `storage.PusherOptions.VectorSource` is
+non-nil when the archive has an active generation and the target accepts vectors
+(`push_vectors`), and the pusher replicates what the export hands it.
+
+`cmd/agentsview/replica_vector_search.go` is the one serve-side gate. It runs
+for every replica in `prepareReplicaServeImpl` and on the CLI direct-read path,
+handles usage-only archives, `[vector]` disabled, fingerprint lookup, encoder
+construction, and the miss notice, then installs the searcher. A replica that
+implements neither interface gets a plain unsupported reason. PostgreSQL
+(`internal/postgres/backend.go`, `vector_search.go`) and ClickHouse
+(`internal/clickhouse/backend.go`, `vector_search.go`, `vector_push.go`) are the
+two implementations; `internal/backendcontract` asserts both.
+
+What a new backend does not touch: `internal/server` HTTP handlers,
+`archive_write_backend.go`, `replica.go`, `replica_watch.go`,
+`replica_vector_search.go`, or the PostgreSQL and DuckDB packages. `pg serve`
+extras (raw-upload ingestion) live in `cmd/agentsview/pg.go` behind the optional
+`replicaServeExtras` interface; a backend with no extras implements nothing.
+
+Known limits: `pg vectors`, the CLI direct-read transport that selects
+PostgreSQL, and `clearPGClassifierHash` remain PostgreSQL-specific. The daemon
+push request carries a backend-neutral `replica` target, so a CLI and daemon
+must run the same `server.APIVersion`, which the CLI already enforces. In that
+target `push_vectors` is optional: omitted means the vector phase runs, the same
+default as the `[pg]` config key, and an explicit `false` opts out.
 
 ## Backend Parity
 
@@ -316,6 +445,63 @@ to recover the text.
   to a remote DuckDB service.
 - Replace a file only after identifying it as an agentsview DuckDB mirror. Fail
   closed for unknown files.
+
+## ClickHouse Replica
+
+ClickHouse is a replica in the `storage.Replica` sense: the archive pushes into
+it and `clickhouse serve` reads from it. Its push cursor lives in the mirror's
+own metadata, which is why the docs below call the database a mirror.
+
+- SQLite is the archive. `clickhouse push` writes ClickHouse. `clickhouse serve`
+  queries ClickHouse for the HTTP API and UI. Vectors ride the same push:
+  `vector_generations`, `vector_documents`, `vector_chunks`, and
+  `vector_push_state` are ReplacingMergeTree tables keyed by config
+  fingerprint and source archive, and the searcher ranks chunks with an exact
+  `cosineDistance` scan (no vector similarity index yet; the query already has
+  the `ORDER BY distance LIMIT` shape that index accelerates). Dashboard
+  writes (rename, trash, insights, stars, pins) return `db.ErrReadOnly` and
+  stay on SQLite. Never delete, drop, truncate, or recreate SQLite to handle a
+  ClickHouse schema or data-version change. Design decisions live in
+  [ClickHouse push and serve](../internal/clickhouse-mirror.md).
+- Keep push order per batch: insert dependents, then
+  `DELETE ... WHERE session_id IN (...) AND push_version < v`, then session
+  rows. Store every ClickHouse push cursor and version in the mirror's
+  `sync_metadata`. Never store ClickHouse sync state in SQLite.
+- Every mirrored table is `ReplacingMergeTree(push_version)`. Every connection
+  sets `final = 1`. Do not write `FINAL` in query text. `OpenForAdmin`
+  bootstraps through the server `default` database; do not ping a DSN-path
+  database that does not exist yet.
+- Derived tables (`usage_messages`, `terminal_event_snapshots`) are
+  insert-maintained by materialized views and keyed by
+  `ReplacingMergeTree(revision)`, where live rows use an odd revision above
+  the backfill's even one. Readers check them against `sessions.push_version`:
+  `usage_messages` rows count at or above it, because messages land before the
+  session row is published, and `terminal_event_snapshots` rows match it
+  exactly. A materialized view runs inside the insert and reads joined tables
+  in full, so filter a joined table to the inserted block's sessions. Views
+  never see deletes; `deleteMirrorSessions` clears the derived tables. Startup
+  backfills record completion in `sync_metadata` only after finishing, never
+  modify source tables, and must stay safe to repeat. See the
+  [Activity report reads](../internal/clickhouse-mirror.md#activity-report-reads)
+  design section.
+- Activity report queries receive the selected session IDs as the
+  `activity_candidate_ids` external table on the request context. Do not
+  rebuild candidate discovery inside later queries, and never materialize a
+  recursive CTE.
+- Design ClickHouse SQL for MergeTree. Do not paste PostgreSQL or DuckDB queries
+  unchanged. Orphan filters must treat `parent_session_id IS NULL` as an
+  orphan (`NULL NOT IN (...)` is unknown).
+- clickhouse-go inlines every bound argument into the statement text, and the
+  server rejects statements over `max_query_size` (256 KiB by default). Never
+  build an `IN (...)` list from a set the database already selected, such as
+  the sessions matching a filter or the Claude snapshot keys of those
+  sessions. Embed the selecting predicate as a subquery (`chSessionSet`) or
+  derive the keys in a CTE instead. Chunked lists (`chQueryChunked`) are for
+  sets that arrive from outside the database, and they bound entry count, not
+  bytes.
+- Tests use the `chtest` build tag. Run `make test-clickhouse` against a
+  dedicated test server (`TEST_CLICKHOUSE_URL` or the compose service). Do not
+  point those tests at a live mirror.
 
 ## PostgreSQL Integration Tests
 

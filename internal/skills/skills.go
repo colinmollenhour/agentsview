@@ -18,7 +18,7 @@ import (
 	"text/template"
 )
 
-//go:embed templates/finding-history.md.tmpl
+//go:embed templates/*.md.tmpl templates/LICENSE
 var templatesFS embed.FS
 
 // Harness identifies a skill discovery convention.
@@ -38,13 +38,24 @@ func AllHarnesses() []Harness {
 // package currently renders.
 const skillName = "agentsview-finding-history"
 
+// licenseFileName is the MIT sidecar installed next to SKILL.md so the
+// model-facing skill and agent files do not carry the copyright text.
+const licenseFileName = "LICENSE"
+
+// claudeAgentDir is the Claude project agent directory, both as the prose
+// fragment in the delegation guard and as the base of the search agent's
+// install path.
+const claudeAgentDir = ".claude/agents"
+
 // delegatePhrases supplies the harness-specific instruction that replaces
 // {{.Delegate}} in the template: whether the harness can dispatch a search
 // subagent or must run the bounded probes itself.
 var delegatePhrases = map[Harness]string{
-	HarnessClaude: "Dispatch a search subagent (e.g. the Task/Agent tool)",
-	HarnessAgents: "Delegate to a search subagent if your harness supports one; " +
-		"otherwise run the bounded probes yourself in order",
+	HarnessClaude: "Use the `agentsview-search-conversations` agent when this harness exposes it " +
+		"and the AgentsView MCP server is registered as `agentsview`; " +
+		"otherwise follow these steps directly",
+	HarnessAgents: "Delegate to a permitted search agent if this harness provides one; " +
+		"otherwise follow these steps directly",
 }
 
 // skillsSubdir is the harness-specific path segment under the install base,
@@ -73,7 +84,7 @@ var headerPattern = regexp.MustCompile(
 // and Render re-emits it above the generated-by header.
 const frontmatterFence = "---\n"
 
-var tmpl = template.Must(template.ParseFS(templatesFS, "templates/finding-history.md.tmpl"))
+var tmpl = template.Must(template.ParseFS(templatesFS, "templates/*.md.tmpl"))
 
 // Remote is the optional remote-daemon targeting baked into generated
 // examples so `skills install` on a shared archive does not teach the
@@ -174,13 +185,19 @@ func ParseRemote(content string) Remote {
 type templateData struct {
 	Delegate   string
 	ServerArgs string
+	// AgentDir is the harness's project-level agent directory, included in
+	// the delegation guard when the harness installs the search agent. Empty
+	// for harnesses that do not install one, so the guard text omits the
+	// project-directory clause.
+	AgentDir string
 }
 
 // Rendered is one skill file ready to install.
 type Rendered struct {
-	Name    string // "agentsview-finding-history"
-	Content string // full file: frontmatter fence, generated-by header, rest
-	Hash    string // sha256 hex of Content minus the header line
+	Name         string // artifact name from its frontmatter
+	RelativePath string // install path relative to the user or project base
+	Content      string // full file: frontmatter fence, generated-by header, rest
+	Hash         string // sha256 hex of Content minus the header line
 }
 
 // Render produces the skill for a harness. version is the CLI version
@@ -198,17 +215,10 @@ func Render(h Harness, version string, remote Remote) (Rendered, error) {
 		return Rendered{}, err
 	}
 
-	var body bytes.Buffer
 	data := templateData{Delegate: delegate, ServerArgs: remote.Args()}
-	if err := tmpl.ExecuteTemplate(&body, "finding-history.md.tmpl", data); err != nil {
-		return Rendered{}, fmt.Errorf("skills: render %s template: %w", h, err)
+	if h == HarnessClaude {
+		data.AgentDir = claudeAgentDir
 	}
-	if !strings.HasPrefix(body.String(), frontmatterFence) {
-		return Rendered{}, fmt.Errorf(
-			"skills: %s template must start with a %q frontmatter fence", h, "---")
-	}
-
-	rest := strings.TrimPrefix(body.String(), frontmatterFence)
 	var remoteLine string
 	if !remote.Empty() {
 		payload, err := json.Marshal(remote)
@@ -217,15 +227,99 @@ func Render(h Harness, version string, remote Remote) (Rendered, error) {
 		}
 		remoteLine = installRemotePrefix + string(payload) + "\n"
 	}
+	return renderTemplate(
+		skillName,
+		"",
+		"finding-history.md.tmpl",
+		data,
+		version,
+		remoteLine,
+	)
+}
+
+// RenderPackage produces every artifact supported by h. Both harnesses get
+// the recall skill and its LICENSE sidecar; Claude also gets the bounded
+// search agent used by it.
+func RenderPackage(h Harness, version string, remote Remote) ([]Rendered, error) {
+	skill, err := Render(h, version, remote)
+	if err != nil {
+		return nil, err
+	}
+	skill.RelativePath = filepath.Join(skillsSubdir[h], skillName, "SKILL.md")
+	license, err := renderLicense(
+		filepath.Join(skillsSubdir[h], skillName, licenseFileName),
+		version,
+	)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := []Rendered{skill, license}
+
+	if h == HarnessClaude {
+		agent, err := renderTemplate(
+			"agentsview-search-conversations",
+			filepath.Join(claudeAgentDir, "agentsview-search-conversations.md"),
+			"search-conversations.md.tmpl",
+			templateData{},
+			version,
+			"",
+		)
+		if err != nil {
+			return nil, err
+		}
+		artifacts = append(artifacts, agent)
+	}
+
+	return artifacts, nil
+}
+
+func renderTemplate(
+	name string,
+	relativePath string,
+	templateName string,
+	data templateData,
+	version string,
+	remoteLine string,
+) (Rendered, error) {
+	var body bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&body, templateName, data); err != nil {
+		return Rendered{}, fmt.Errorf("skills: render %s template: %w", name, err)
+	}
+	if !strings.HasPrefix(body.String(), frontmatterFence) {
+		return Rendered{}, fmt.Errorf(
+			"skills: %s template must start with a %q frontmatter fence", name, "---")
+	}
+
+	rest := strings.TrimPrefix(body.String(), frontmatterFence)
 	hashed := frontmatterFence + remoteLine + rest
 	hash := bodyHash(hashed)
 	header := fmt.Sprintf(headerFormat, version, hash)
 	content := frontmatterFence + header + "\n" + remoteLine + rest
 
 	return Rendered{
-		Name:    skillName,
-		Content: content,
-		Hash:    hash,
+		Name:         name,
+		RelativePath: relativePath,
+		Content:      content,
+		Hash:         hash,
+	}, nil
+}
+
+// renderLicense wraps the static MIT sidecar with a generated-by header on
+// line one. Skill and agent files keep the header inside frontmatter so
+// harnesses still discover them; LICENSE is not parsed as frontmatter.
+func renderLicense(relativePath, version string) (Rendered, error) {
+	body, err := templatesFS.ReadFile("templates/" + licenseFileName)
+	if err != nil {
+		return Rendered{}, fmt.Errorf("skills: read %s: %w", licenseFileName, err)
+	}
+	hashed := string(body)
+	hash := bodyHash(hashed)
+	header := fmt.Sprintf(headerFormat, version, hash)
+	return Rendered{
+		Name:         licenseFileName,
+		RelativePath: relativePath,
+		Content:      header + "\n" + hashed,
+		Hash:         hash,
 	}, nil
 }
 
@@ -255,14 +349,9 @@ func Classify(existing []byte, fresh Rendered) InstalledState {
 		return StateMissing
 	}
 
-	content := string(existing)
-	if !strings.HasPrefix(content, frontmatterFence) {
+	headerLine, hashedBody, ok := splitGeneratedBody(string(existing))
+	if !ok {
 		return StateForeign
-	}
-	headerLine, rest, hasRest := strings.Cut(
-		strings.TrimPrefix(content, frontmatterFence), "\n")
-	if !hasRest {
-		rest = ""
 	}
 
 	match := headerPattern.FindStringSubmatch(headerLine)
@@ -271,13 +360,37 @@ func Classify(existing []byte, fresh Rendered) InstalledState {
 	}
 	recordedHash := match[1]
 
-	if recordedHash != bodyHash(frontmatterFence+rest) {
+	if recordedHash != bodyHash(hashedBody) {
 		return StateModified
 	}
 	if recordedHash == fresh.Hash {
 		return StateCurrent
 	}
 	return StateStale
+}
+
+// splitGeneratedBody extracts the generated-by header line and the hashed
+// body from an installed file. Frontmatter files keep "---" as the first
+// line and put the header on line two; the hash covers the fence plus
+// everything after the header. Sidecar files such as LICENSE put the
+// header on line one and hash the remainder.
+func splitGeneratedBody(content string) (headerLine, hashedBody string, ok bool) {
+	if rest, hasFence := strings.CutPrefix(content, frontmatterFence); hasFence {
+		headerLine, rest, hasRest := strings.Cut(rest, "\n")
+		if !hasRest {
+			rest = ""
+		}
+		return headerLine, frontmatterFence + rest, true
+	}
+
+	headerLine, rest, hasRest := strings.Cut(content, "\n")
+	if !hasRest {
+		return "", "", false
+	}
+	if headerPattern.FindStringSubmatch(headerLine) == nil {
+		return "", "", false
+	}
+	return headerLine, rest, true
 }
 
 // bodyHash returns the sha256 hex digest of a rendered file's body, i.e.

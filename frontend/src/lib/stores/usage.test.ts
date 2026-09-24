@@ -1,3 +1,5 @@
+import { attachResponseTiming } from "../api/runtime.js";
+import { UsageService } from "../api/generated/index";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type {
   Comparison,
@@ -143,12 +145,15 @@ const apiRuntimeMocks = vi.hoisted(() => {
   }
   return {
     ApiError,
-    callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+
     isAbortError: vi.fn(() => false),
   };
 });
 
-vi.mock("../api/runtime.js", () => apiRuntimeMocks);
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
+  ...apiRuntimeMocks,
+}));
 
 vi.mock("../api/generated/index", () => ({
   UsageService: {
@@ -386,9 +391,7 @@ function usagePairwiseComparison(): ServiceUsagePairwiseComparisonResponse {
   };
 }
 
-afterEach(() => {
-  apiRuntimeMocks.callGenerated.mockImplementation((request: () => Promise<unknown>) => request());
-});
+afterEach(() => {});
 
 describe("UsageStore filter persistence", () => {
   beforeEach(() => {
@@ -612,23 +615,20 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts an in-flight ranking when the usage mode changes", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(() => new Promise(() => {}));
     const { usage } = await loadStore();
 
     void usage.fetchTopSessions();
     await Promise.resolve();
-    expect(signals[0]?.aborted).toBe(false);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(false);
 
     usage.setMode("token");
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(true);
     expect(usage.topSessions).toBeNull();
   });
 
@@ -887,6 +887,78 @@ describe("UsageStore session filter params", () => {
     }
   });
 
+  it("records how long the full refresh took, from request to data applied", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      const { usage } = await loadStore();
+      expect(usage.lastQueryDurationMs).toBeNull();
+
+      // The slowest panel bounds the refresh: top sessions lands 400 ms in.
+      usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(400);
+        return [];
+      });
+      await usage.fetchAll();
+
+      expect(usage.lastQueryDurationMs).toBe(400);
+      expect(usage.lastQuerySteps[0]?.name).toBe("summary");
+      expect(usage.lastQuerySteps).toContainEqual({
+        name: "topSessions",
+        startMs: 0,
+        durationMs: 400,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records the window summary as its own step and delays apply until both arrive", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      const { usage } = await loadStore();
+      usage.applyDateRange("2026-06-04", "2026-06-18");
+      usage.summary = usageSummary(15);
+      usage.selectedTimeRange = { from: "2026-06-07", to: "2026-06-10" };
+      // The selected-range response lands 20 ms after it is sent, the
+      // full-window one 60 ms after; the store applies both together.
+      const timedSummary = async (params: { from?: string; to?: string }) => {
+        const sentAt = performance.now();
+        const isWindow = params.from === "2026-06-04" && params.to === "2026-06-18";
+        const data = usageSummary(isWindow ? 15 : 3);
+        await Promise.resolve();
+        vi.advanceTimersByTime(isWindow ? 60 : 20);
+        const at = performance.now();
+        attachResponseTiming(data, { sentAt, headersAt: at, bodyAt: at });
+        return data;
+      };
+      // One-shot for the two summary requests of this refresh only, so the
+      // default mock stays in place for later tests.
+      usageServiceMocks.getApiV1UsageSummary
+        .mockImplementationOnce(timedSummary)
+        .mockImplementationOnce(timedSummary);
+
+      await usage.fetchAll({ preserveTimeRange: true });
+
+      expect(usage.lastQuerySteps.map((step) => step.name).slice(0, 2)).toEqual([
+        "summary",
+        "contextSummary",
+      ]);
+      const summary = usage.lastQuerySteps.find((step) => step.name === "summary")!;
+      const window = usage.lastQuerySteps.find((step) => step.name === "contextSummary")!;
+      const windowBody = window.segments!.find((segment) => segment.phase === "download")!;
+      // The selected-range body arrived first; its apply phase waits for the
+      // window body instead of being drawn as render time.
+      expect(summary.segments!.find((segment) => segment.phase === "apply")!.startMs).toBe(
+        windowBody.startMs + windowBody.durationMs,
+      );
+      expect(
+        summary.segments!.find((segment) => segment.phase === "download")!.startMs,
+      ).toBeLessThan(windowBody.startMs);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not mark cached partial refresh failures as current", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1006,13 +1078,6 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts stale top sessions when a new full refresh starts", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(() => new Promise(() => {}));
     usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(() => new Promise(() => {}));
 
@@ -1020,22 +1085,19 @@ describe("UsageStore session filter params", () => {
 
     void usage.fetchTopSessions();
     await Promise.resolve();
-    expect(signals[0]?.aborted).toBe(false);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(false);
 
     void usage.fetchAll();
     await Promise.resolve();
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(true);
   });
 
   it("aborts visible panel requests on teardown", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(() => new Promise(() => {}));
     const { usage } = await loadStore();
 
@@ -1043,7 +1105,9 @@ describe("UsageStore session filter params", () => {
     await Promise.resolve();
     usage.cancelInFlightReads();
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(vi.mocked(UsageService.getApiV1UsageSummary).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
   });
 
   it("reuses summary params for top sessions during full refresh", async () => {
@@ -1078,14 +1142,6 @@ describe("UsageStore session filter params", () => {
   });
 
   it("does not let stale comparison abort the current comparison", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
-
     const { usage } = await loadStore();
     const loaded = await usage.fetchSummary({ loadComparison: false });
     expect(loaded).not.toBeNull();
@@ -1113,7 +1169,8 @@ describe("UsageStore session filter params", () => {
       loadedSummary.params,
     );
     await Promise.resolve();
-    const currentSignal = signals[1];
+    const currentSignal = vi.mocked(UsageService.getApiV1UsageComparison).mock.calls[0]?.[1]
+      ?.signal;
     expect(currentSignal).toBeDefined();
     expect(currentSignal?.aborted).toBe(false);
 
@@ -1131,14 +1188,6 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts active comparison when a newer summary starts", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
-
     const { usage } = await loadStore();
     const loaded = await usage.fetchSummary({ loadComparison: false });
     expect(loaded).not.toBeNull();
@@ -1159,7 +1208,8 @@ describe("UsageStore session filter params", () => {
       loadedSummary.params,
     );
     await Promise.resolve();
-    const comparisonSignal = signals[1];
+    const comparisonSignal = vi.mocked(UsageService.getApiV1UsageComparison).mock.calls[0]?.[1]
+      ?.signal;
     expect(comparisonSignal).toBeDefined();
     expect(comparisonSignal?.aborted).toBe(false);
 
@@ -1262,13 +1312,6 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts stale summary requests when a newer fetch starts", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageSummary
       .mockImplementationOnce(() => new Promise(() => {}))
       .mockResolvedValueOnce({
@@ -1307,8 +1350,10 @@ describe("UsageStore session filter params", () => {
     void usage.fetchSummary();
     await Promise.resolve();
 
-    expect(signals[0]).toBeDefined();
-    expect(signals[0]?.aborted).toBe(true);
+    expect(vi.mocked(UsageService.getApiV1UsageSummary).mock.calls[0]?.[1]?.signal).toBeDefined();
+    expect(vi.mocked(UsageService.getApiV1UsageSummary).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
   });
 });
 

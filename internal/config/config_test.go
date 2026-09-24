@@ -2,7 +2,6 @@ package config
 
 import (
 	"bytes"
-	"context"
 	"flag"
 	"log"
 	"os"
@@ -23,6 +22,32 @@ import (
 )
 
 const configFileName = "config.toml"
+
+func TestCodeBuddyDefaultAndOverride(t *testing.T) {
+	home := canonicalTempDir(t)
+	setTestHome(t, home)
+	for _, appData := range []string{"", "relative", canonicalTempDir(t)} {
+		t.Run(appData, func(t *testing.T) {
+			t.Setenv("LOCALAPPDATA", appData)
+			t.Setenv("CODEBUDDY_DIR", "")
+			cfg, err := Default()
+			require.NoError(t, err)
+			dirs := cfg.ResolveDirs(parser.AgentCodeBuddy)
+			require.Len(t, dirs, 3)
+			expected := filepath.Join(home, "AppData", "Local", "CodeBuddyExtension", "Data")
+			if runtime.GOOS == "windows" && filepath.IsAbs(appData) {
+				expected = filepath.Join(appData, "CodeBuddyExtension", "Data")
+			}
+			assert.Equal(t, expected, dirs[0])
+			assert.Equal(t, filepath.Join(home, "Library", "Application Support", "CodeBuddyExtension", "Data"), dirs[1])
+			assert.Equal(t, filepath.Join(home, ".config", "CodeBuddyExtension", "Data"), dirs[2])
+			custom := canonicalTempDir(t)
+			t.Setenv("CODEBUDDY_DIR", custom)
+			cfg.loadEnv()
+			assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentCodeBuddy))
+		})
+	}
+}
 
 func skipIfNotUnix(t *testing.T) {
 	t.Helper()
@@ -485,6 +510,7 @@ func TestDefault_IncludesHermesProfilesRoot(t *testing.T) {
 
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "sessions"))
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "profiles"))
+	assert.Contains(t, dirs, filepath.Join(home, "AppData", "Local", "hermes", "sessions"))
 }
 
 func TestDefault_HermesNoProfilesDirIsSafe(t *testing.T) {
@@ -511,6 +537,18 @@ func TestDefault_HermesEnvReplacesDefaultAndProfilesRoots(t *testing.T) {
 	assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentHermes))
 }
 
+func TestLoad_HermesConfigDirsReplaceAllDefaultRoots(t *testing.T) {
+	t.Setenv("HERMES_SESSIONS_DIR", "")
+	custom := filepath.Join(canonicalTempDir(t), "hermes-sessions")
+
+	cfg := loadMinimalWithConfig(t, map[string]any{
+		"hermes_sessions_dirs": []string{custom},
+	})
+
+	assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentHermes))
+	assert.True(t, cfg.IsUserConfigured(parser.AgentHermes))
+}
+
 func TestLoadEnv_GoosePathRootUsesProducerLayout(t *testing.T) {
 	for _, basename := range []string{"data", "sessions"} {
 		t.Run(basename, func(t *testing.T) {
@@ -526,7 +564,7 @@ func TestLoadEnv_GoosePathRootUsesProducerLayout(t *testing.T) {
 			})
 			require.True(t, ok)
 
-			plan, err := provider.WatchPlan(context.Background())
+			plan, err := provider.WatchPlan(t.Context())
 			require.NoError(t, err)
 			require.Len(t, plan.Roots, 1)
 			assert.Equal(t,
@@ -632,6 +670,73 @@ func TestLoadPFlags_AppliesExplicitFlags(t *testing.T) {
 
 	assert.Equal(t, "0.0.0.0", cfg.Host)
 	assert.Equal(t, 9090, cfg.Port)
+}
+
+func TestPortExplicitProvenance(t *testing.T) {
+	t.Run("standard flag marks explicit default", func(t *testing.T) {
+		cfg, err := loadConfigFromFlags(t, "-port", "8080")
+		require.NoError(t, err)
+		assert.Equal(t, 8080, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("pflag marks explicit default", func(t *testing.T) {
+		cfg, err := loadConfigFromPFlags(t, "--port", "8080")
+		require.NoError(t, err)
+		assert.Equal(t, 8080, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("explicit zero remains explicit", func(t *testing.T) {
+		cfg, err := loadConfigFromPFlags(t, "--port", "0")
+		require.NoError(t, err)
+		assert.Zero(t, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("omitted port stays implicit", func(t *testing.T) {
+		standard, err := loadConfigFromFlags(t)
+		require.NoError(t, err)
+		pflagConfig, err := loadConfigFromPFlags(t)
+		require.NoError(t, err)
+		assert.Equal(t, 8080, standard.Port)
+		assert.False(t, standard.PortExplicit)
+		assert.Equal(t, 8080, pflagConfig.Port)
+		assert.False(t, pflagConfig.PortExplicit)
+	})
+
+	t.Run("persisted port stays implicit", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		writeConfig(t, dir, map[string]any{"port": 7357})
+		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+		RegisterServePFlags(fs)
+		cfg, err := LoadPFlags(fs)
+		require.NoError(t, err)
+		assert.Equal(t, 7357, cfg.Port)
+		assert.False(t, cfg.PortExplicit)
+	})
+
+	t.Run("pg and duckdb loaders mark explicit ports", func(t *testing.T) {
+		for _, load := range []struct {
+			name string
+			fn   func(*pflag.FlagSet) (Config, error)
+		}{
+			{name: "pg", fn: LoadRemoteServePFlags},
+			{name: "duckdb", fn: LoadRemoteServePFlags},
+			{name: "clickhouse", fn: LoadRemoteServePFlags},
+		} {
+			t.Run(load.name, func(t *testing.T) {
+				setupTestEnv(t)
+				fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+				RegisterServePFlags(fs)
+				require.NoError(t, fs.Parse([]string{"--port", "8080"}))
+				cfg, err := load.fn(fs)
+				require.NoError(t, err)
+				assert.Equal(t, 8080, cfg.Port)
+				assert.True(t, cfg.PortExplicit)
+			})
+		}
+	})
 }
 
 func TestLoad_NilFlagSet(t *testing.T) {
@@ -985,6 +1090,13 @@ func TestAgentDirsExplicitEmptyArrayOverridesDefaults(t *testing.T) {
 	assert.True(t, cfg.IsUserConfigured(parser.AgentGrok))
 	assert.Empty(t, cfg.ResolveDirs(parser.AgentCopilot))
 	assert.True(t, cfg.IsUserConfigured(parser.AgentCopilot))
+}
+
+func TestDefaultWatchExcludesTransientLockFiles(t *testing.T) {
+	cfg, err := Default()
+	require.NoError(t, err)
+
+	assert.Contains(t, cfg.WatchExcludePatterns, "*.lock*")
 }
 
 func TestAgentDirsEnvBeatsExplicitEmptyArray(t *testing.T) {
@@ -2419,7 +2531,7 @@ func TestLoadFile_CustomModelPricing(t *testing.T) {
 			for model, wantRate := range tt.want {
 				got, ok := cfg.CustomModelPricing[model]
 				if !ok {
-					t.Errorf("missing model %q", model)
+					assert.Failf(t, "test failed", "missing model %q", model)
 					continue
 				}
 				assert.Equal(t, wantRate, got, "model %q", model)
@@ -2547,6 +2659,7 @@ func TestLoadFile_RemoteHostsAbsentIsNil(t *testing.T) {
 }
 
 func TestValidateRemoteHosts(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		hosts   []RemoteHost
@@ -2582,6 +2695,7 @@ func TestValidateRemoteHosts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := Config{RemoteHosts: tt.hosts}.ValidateRemoteHosts()
 			if len(tt.wantErr) == 0 {
 				require.NoError(t, err)
@@ -2717,6 +2831,7 @@ func TestIsDefaultAgentsviewDBPath(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, IsDefaultAgentsviewDBPath(tc.dbPath))
 		})
 	}
@@ -2876,8 +2991,7 @@ func TestDisabledAgentsNormalizeWithoutHidingConfiguredDirs(t *testing.T) {
 disabled_agents = [" gemini ", "claude", "gemini"]
 `))
 
-	assert.Equal(t,
-		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+	assert.Equal(t, []parser.AgentType{parser.AgentClaude, parser.AgentGemini},
 		cfg.DisabledAgents,
 	)
 	assert.Equal(t, geminiDirs, cfg.ResolveDirs(parser.AgentGemini))

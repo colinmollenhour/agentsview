@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"go.kenn.io/agentsview/internal/signals"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // maxSQLVars is the maximum bind variables per IN clause to stay
@@ -1110,6 +1111,7 @@ func (db *DB) GetAnalyticsSummary(
 		return AnalyticsSummary{},
 			fmt.Errorf("querying analytics summary: %w", err)
 	}
+	defer rows.Close()
 	s := AnalyticsSummary{
 		Agents: make(map[string]*AgentSummary),
 		Models: []string{},
@@ -4915,15 +4917,15 @@ func normalizeEvidenceText(content string) string {
 	return spaceReplacer(lower)
 }
 
-func truncateExcerpt(s string, max int) string {
+func truncateExcerpt(s string, maximum int) string {
 	s = strings.TrimSpace(spaceReplacer(s))
-	if len(s) <= max {
+	if len(s) <= maximum {
 		return s
 	}
-	if max <= 3 {
-		return s[:max]
+	if maximum <= 3 {
+		return stringutil.SafeTruncate(s, maximum)
 	}
-	return s[:max-3] + "..."
+	return stringutil.SafeTruncate(s, maximum-3) + "..."
 }
 
 func spaceReplacer(s string) string {
@@ -5011,8 +5013,7 @@ func AggregateSignals(
 		resp.ContextHealth.AvgCompactionCount += float64(
 			r.CompactionCount,
 		)
-		resp.ContextHealth.MidTaskCompactionCount +=
-			r.MidTaskCompactionCount
+		resp.ContextHealth.MidTaskCompactionCount += r.MidTaskCompactionCount
 		if r.MidTaskCompactionCount > 0 {
 			resp.ContextHealth.SessionsWithMidTaskCompac++
 		}
@@ -5253,8 +5254,7 @@ func accumulateQualityHealth(
 		q.Totals.UnstructuredStart++
 		q.SessionsWithSignal.UnstructuredStart++
 	}
-	q.Totals.MissingSuccessCriteriaCount +=
-		r.MissingSuccessCriteriaCount
+	q.Totals.MissingSuccessCriteriaCount += r.MissingSuccessCriteriaCount
 	if r.MissingSuccessCriteriaCount > 0 {
 		q.SessionsWithSignal.MissingSuccessCriteriaCount++
 	}

@@ -152,9 +152,8 @@ are hours. Color intensity represents message volume.
 
 ### Activity Timeline
 
-A stacked chart showing messages, sessions, tool calls, and thinking blocks over
-time. Toggle between daily, weekly, and monthly granularity. Includes breakdown
-by agent.
+Compare message or session counts over time. Switch between Day, Week, and
+Month to change how the chart groups activity.
 
 ![Activity timeline](/docs/assets/generated/screenshots/activity-timeline.png)
 
@@ -351,8 +350,8 @@ Each session item shows:
 - **Agent-provided session names** — several agents record a session title
   themselves (Claude Code's `/rename`, Codex `session_index.jsonl` thread
   names, Claude.ai and ChatGPT conversation names, Forge, Hermes, Kiro,
-  Piebald, Cortex Code, and Command Code's `.meta.json` titles). As of 0.33.0,
-  the sidebar shows these titles automatically when present. Manual in-app
+  Piebald, Cortex Code, WorkBuddy, and Command Code's `.meta.json` titles). The
+  sidebar shows these titles automatically when present. Manual in-app
   renames always take precedence and are never overwritten by an
   agent-provided name. As of 0.34.0, Codex titles renamed by the agent are
   imported from `session_index.jsonl` for both current and archived sessions.
@@ -482,15 +481,27 @@ persisted to localStorage and serialized into the URL.
 ### Direct Session Links
 
 Click **Copy link to session** in the detail header to copy a shareable URL.
-Clicking the **Session ID** copies only the ID. You can also bookmark the
-current URL:
+Clicking the **Session ID** copies only the ID. Session links give the provider
+and native ID separate path segments, for example:
 
 ```
-/sessions/550e8400-e29b-41d4-a716-446655440000
+/sessions/codex/550e8400-e29b-41d4-a716-446655440000
 ```
+
+Older links with an encoded provider prefix still open. IDs without a provider
+prefix use a single segment after `/sessions/`.
 
 Session URLs work as bookmarks and can be shared with teammates when using
 [PostgreSQL sync](/docs/pg-sync/) for shared deployments.
+
+### Open a session by ID
+
+Press `Cmd+G` on macOS or `Ctrl+G` elsewhere. Paste a complete session ID or
+UUID, then press Enter. This opens the session without changing the sidebar
+filters. If the UUID matches more than one session, use its full ID with the
+provider prefix, such as `codex:550e8400-e29b-41d4-a716-446655440000`.
+
+![Open a session by ID or UUID](/docs/assets/generated/screenshots/open-session.png)
 
 ### URL Filters
 
@@ -828,44 +839,56 @@ state instead of a score. See
 
 ### Session Vital Signs
 
-The right column of an open session shows a **Session Vital Signs** panel with
-timing data derived from the message timestamps. Toggle it from the session
-header.
+Open **Analysis** from the session header to see Session Vitals in the right
+column. It shows elapsed turn time and measured tool durations.
 
 ![Session Vital Signs in context](/docs/assets/generated/screenshots/session-vital-signs.png)
 
-It has five stacked sections when experimental Recall is available:
+The panel contains these sections, including experimental Recall when available:
 
 - **Session summary** — repository and worktree context recorded by the trace,
-  total wall-clock, turn count, tool call count, sub-agent count, and the
-  slowest call as a clickable link that scrolls the conversation to that call.
-  Live sessions show a `running …+` indicator that ticks forward.
+    total wall-clock, turn count, tool call count, sub-agent count, and the
+    slowest call as a clickable link that scrolls the conversation to that call.
+    Live sessions show a `running …+` indicator that ticks forward.
 - **Recall (experimental)** — provenance-linked entries whose evidence comes
-  from the current session. Evidence-range links jump to the supporting
-  transcript message. An empty state appears when the local archive has no
-  matching entries.
+    from the current session. Evidence-range links jump to the supporting
+    transcript message. An empty state appears when the local archive has no
+    matching entries.
+- **Turn activity** — each visible user prompt starts a window that ends at the
+    next prompt or the session boundary. Bars separate measured tool execution
+    from unattributed time, which has no measured phase boundaries. Thinking
+    and response generation are not measured. Click a row to jump to its prompt
+    in the transcript.
 - **Time spent** — per-category aggregate bars across the normalized taxonomy
-  (`Read`, `Edit`, `Write`, `Bash`, `Grep`, `Glob`, `Task`, `Tool`, `Other`,
-  plus a `Mixed` bucket for turns split across categories). Click a row to
-  filter the rest of the panel to that category.
+    (`Read`, `Edit`, `Write`, `Bash`, `Grep`, `Glob`, `Task`, `Tool`, `Other`,
+    and other provider categories). Click a row to filter the rest of the panel
+    to that category.
 - **Timeline** — turns lane plus per-category lanes plus an activity lane, with
-  a legend. Hover a turn segment to see its primary category and duration
-  (e.g. `Task · 2m`); click to scroll the conversation to that turn.
+    a legend. Hover a turn segment to see its primary category and duration
+    (e.g. `Task · 2m`); click to scroll the conversation to that turn.
 - **Calls** — chronological list of tool calls with horizontal duration bars.
-  Parallel `tool_use` runs are bracketed as a single group. Call details start
-  collapsed for quicker transcript navigation. Sub-agent rows expand inline to
-  show the child session's calls.
+    Parallel `tool_use` runs are bracketed as a single group. Call details start
+    collapsed for quicker transcript navigation. Sub-agent rows expand inline to
+    show the child session's calls.
 
 ![Vital Signs panel detail](/docs/assets/generated/screenshots/vital-signs-panel.png)
 
-Inline in the conversation column, each `ToolBlock` header gets a duration
-badge, and each assistant message gets a turn-summary line ("turn 2m 18s · 3
-calls"). Parallel non-sub-agent calls render with a striped bar and a
-`≤duration` upper bound — the JSONL source has only one timestamp per assistant
-message, so per-call precision inside parallel groups isn't recoverable for
-non-sub-agent calls. Tool labels are normalized across agents, so Codex's
-`exec_command` and Claude's `Bash` show up under the same "Bash" category in
-headers and in the Calls list.
+Tool durations come from paired execution events or a closed linked child
+session. A call without either source shows `unknown`; the summary and category
+totals show **Not measured** when no calls have measured durations. A measured
+zero remains `0ms`. Categories remain available as filters even without timing.
+An open child needs a completed execution interval before its call can show a
+duration; otherwise it stays unknown until the child closes.
+
+Session tool and category totals count only time within the session boundaries.
+Individual calls retain their full measured durations, including any time
+outside the parent session. Overlapping calls count once in the session total
+and once per category, so category totals can overlap each other.
+
+Inline in the conversation column, tool headers show measured durations when
+available, and assistant messages show turn-summary lines. Tool labels are
+normalized across agents, so Codex's `exec_command` and Claude's `Bash` show up
+under the same "Bash" category in headers and in the Calls list.
 
 Call duration bars in the Calls list are scaled relative to the longest call in
 scope, not total session wall-clock — so even in long sessions where any single
@@ -911,12 +934,14 @@ overlay.
 
 ### Recent Sessions
 
-With an empty or short query (under 3 characters), the palette shows your 10
-most recent sessions. Type to filter by project name or first message.
+With an empty query, the palette shows up to 10 recent sessions from the
+sidebar's current list. A short query filters that list by project, session
+name, or first message. Search begins at 3 characters, or 2 characters for
+Chinese, Japanese, and Korean text.
 
 ### Search Modes
 
-Type 3 or more characters to search in one of three modes:
+Search in one of three modes:
 
 - **Full text** searches indexed message content with FTS5. It also matches
   session display names and first messages.
@@ -966,6 +991,18 @@ Results use a compact row:
 
 Select a result to jump to that session and scroll directly to the matching
 message.
+
+### Project and date filters
+
+Once your query is long enough to search, the palette shows project and date
+controls. Search starts with the sidebar's selected project; choose another
+project or **All Projects** without changing the sidebar.
+
+Choose a relative period, calendar period, or custom dates. The filters apply
+to Full text, Semantic, and Hybrid searches. Closing the palette clears its date
+range; the next opening starts with the sidebar's current project again.
+
+![Command palette with project and date filters](/docs/assets/generated/screenshots/search-filters.png)
 
 ### Keyboard Navigation
 
@@ -1021,6 +1058,12 @@ agents, the menu can launch the configured terminal, use the default terminal,
 or copy the exact resume command. Cursor resume resolves the original workspace
 path and passes it as `--workspace` to `cursor agent --resume`. The same menu
 can copy the session directory and open it in detected editors or file browsers.
+
+Pi sessions use `pi --session` with the transcript path when available, or the
+native session ID. For Pi, **Copy command** includes the working directory so
+you can paste the complete command into a shell. Augure Code sessions use
+`augure resume`. Copying a session's directory path also works when that
+directory has been deleted.
 
 Local Codex sessions add **Open in Codex Desktop**, which deep-links to the
 stored thread. Local Claude sessions add **Open in Claude Code**, which opens a
@@ -1168,6 +1211,7 @@ Press `?` to see all shortcuts in a modal overlay.
 | Key       | Action                            |
 | --------- | --------------------------------- |
 | `Cmd+K`   | Open command palette              |
+| `Cmd+G`   | Open a session by ID or UUID       |
 | `Cmd+F`   | Search within current session     |
 | `Esc`     | Close modal / deselect session    |
 | `j` / `↓` | Next message                      |
@@ -1185,7 +1229,8 @@ Press `?` to see all shortcuts in a modal overlay.
 | `p`       | Publish to Gist                   |
 | `?`       | Show shortcuts                    |
 
-Shortcuts are disabled when typing in an input field. `Esc` always works.
+Use `Ctrl` in place of `Cmd` on Windows and Linux. Most shortcuts are disabled
+when typing in an input field. `Esc` always works.
 
 ______________________________________________________________________
 
@@ -1198,7 +1243,7 @@ organized into sections:
 
 | Section            | What You Can Configure                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------- |
-| Language           | Interface language (English, French, Japanese, Korean, Simplified Chinese, or Traditional Chinese)       |
+| Language           | Interface language (Azerbaijani, English, French, Japanese, Korean, Spanish, Simplified Chinese, or Traditional Chinese)       |
 | Appearance         | Theme (light/dark), high-contrast mode, chart colors, message layout, zoom, block visibility             |
 | Date ranges        | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Quality |
 | Session Providers  | Enable session providers, inspect their session directories, and add alternate agent homes               |
@@ -1208,6 +1253,8 @@ organized into sections:
 | Embeddings         | Current semantic-index build phase, progress, throughput, ETA, last result, and local generations        |
 | GitHub             | Personal access token for Gist publishing                                                                |
 | Remote Access      | Remote connections toggle, auth token, connect to remote server                                          |
+
+Spanish is available in builds from `main` after version 0.44.0.
 
 ![Embedding build progress](/docs/assets/generated/screenshots/settings-embeddings.png)
 

@@ -137,11 +137,11 @@ func writeStagedDigestInt(h interface{ Write([]byte) (int, error) }, value int64
 // can never have any content stagedSessionContentDigestTx would find either.
 // A cold staged import can use this to skip both full-table digest scans
 // entirely instead of proving byte-for-byte equality against nothing.
-func stagedSessionHasStoredMessagesTx(
+func stagedSessionHasStoredMessagesTx(ctx context.Context,
 	tx *sql.Tx, sessionID string,
 ) (bool, error) {
 	var exists int
-	err := tx.QueryRow(
+	err := tx.QueryRowContext(ctx,
 		`SELECT 1 FROM messages WHERE session_id = ? LIMIT 1`, sessionID,
 	).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -158,11 +158,11 @@ func stagedSessionHasStoredMessagesTx(
 // stagedSessionContentDigestTx hashes every parser-owned transcript field while
 // ignoring SQLite row IDs. It lets a forced staged verification prove that the
 // normalized content is unchanged and avoid delete/reinsert revision churn.
-func stagedSessionContentDigestTx(
+func stagedSessionContentDigestTx(ctx context.Context,
 	tx *sql.Tx, sessionID string,
 ) ([sha256.Size]byte, error) {
 	h := sha256.New()
-	rows, err := tx.Query(`
+	rows, err := tx.QueryContext(ctx, `
 		SELECT ordinal, role, content, thinking_text, COALESCE(timestamp, ''),
 		       has_thinking, has_tool_use, content_length, is_system, model,
 		       reasoning_effort, token_usage, context_tokens, output_tokens,
@@ -174,6 +174,7 @@ func stagedSessionContentDigestTx(
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var ordinal, hasThinking, hasToolUse, contentLength, isSystem int64
 		var contextTokens, outputTokens, hasContext, hasOutput int64
@@ -216,7 +217,7 @@ func stagedSessionContentDigestTx(
 		return [sha256.Size]byte{}, err
 	}
 
-	rows, err = tx.Query(`
+	rows, err = tx.QueryContext(ctx, `
 		SELECT m.ordinal, COALESCE(tc.call_index, 0), tc.tool_name, tc.category,
 		       COALESCE(tc.tool_use_id, ''), COALESCE(tc.input_json, ''),
 		       COALESCE(tc.skill_name, ''),
@@ -229,6 +230,7 @@ func stagedSessionContentDigestTx(
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var ordinal, callIndex, resultLength int64
 		var toolName, category, toolUseID, inputJSON, skillName string
@@ -260,7 +262,7 @@ func stagedSessionContentDigestTx(
 		return [sha256.Size]byte{}, err
 	}
 
-	rows, err = tx.Query(`
+	rows, err = tx.QueryContext(ctx, `
 		SELECT tool_call_message_ordinal, call_index,
 		       COALESCE(tool_use_id, ''), COALESCE(agent_id, ''),
 		       COALESCE(subagent_session_id, ''), source, status, content,
@@ -272,6 +274,7 @@ func stagedSessionContentDigestTx(
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var ordinal, callIndex, contentLength, eventIndex, summaryParticipates int64
 		var rawContentDigest []byte
@@ -314,12 +317,16 @@ func commitStagedDerivedStateAndCheckpoint(
 	ctx context.Context, conn *sql.Conn, sessionID string,
 	signals *SessionSignalUpdate, findings []SecretFinding,
 	cp *ParserCheckpoint, blobs *ParserCheckpointBlobs,
+	msgs []Message,
 ) error {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := reconcileConversationMessagesTx(tx, sessionID, msgs, true, false); err != nil {
+		return err
+	}
 	// The staged transcript is byte-for-byte identical, so preserve every
 	// message/tool row and the transcript revision. Metadata, detector rules,
 	// and prior failed post-processing may still have changed; refresh every
@@ -342,7 +349,7 @@ func commitStagedDerivedStateAndCheckpoint(
 		}
 	}
 	if cp == nil || blobs == nil {
-		if err := deleteParserCheckpointTx(tx, sessionID); err != nil {
+		if err := deleteParserCheckpointTx(ctx, tx, sessionID); err != nil {
 			return err
 		}
 	} else {
@@ -379,7 +386,7 @@ func (db *DB) replaceSessionContentStaged(
 				return err
 			}
 		}
-		return db.ReplaceSessionContent(sessionID, msgs, update, findings)
+		return db.ReplaceSessionContent(ctx, sessionID, msgs, update, findings)
 	}
 
 	db.mu.Lock()
@@ -416,19 +423,22 @@ func (db *DB) replaceSessionContentStaged(
 	// contentAfter -- skip both full-table scans and go straight to the
 	// changed-content path below instead of paying to read back every byte
 	// this same transaction is about to write.
-	hadStoredContent, err := stagedSessionHasStoredMessagesTx(tx, sessionID)
+	hadStoredContent, err := stagedSessionHasStoredMessagesTx(ctx, tx, sessionID)
 	if err != nil {
 		return err
 	}
 	var contentBefore [sha256.Size]byte
 	if hadStoredContent {
-		contentBefore, err = stagedSessionContentDigestTx(tx, sessionID)
+		contentBefore, err = stagedSessionContentDigestTx(ctx, tx, sessionID)
 		if err != nil {
 			return fmt.Errorf("fingerprinting stored staged content: %w", err)
 		}
 	}
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 
+	if err := reconcileConversationMessagesTx(tx, sessionID, msgs, true, false); err != nil {
+		return err
+	}
 	if err := replaceSessionMessagesTxStaged(
 		ctx, tx, sessionID, msgs, staged, blocked,
 	); err != nil {
@@ -436,7 +446,7 @@ func (db *DB) replaceSessionContentStaged(
 	}
 	contentUnchanged := false
 	if hadStoredContent {
-		contentAfter, err := stagedSessionContentDigestTx(tx, sessionID)
+		contentAfter, err := stagedSessionContentDigestTx(ctx, tx, sessionID)
 		if err != nil {
 			return fmt.Errorf("fingerprinting proposed staged content: %w", err)
 		}
@@ -460,7 +470,7 @@ func (db *DB) replaceSessionContentStaged(
 			return err
 		}
 		return commitStagedDerivedStateAndCheckpoint(
-			ctx, conn, sessionID, signals, findings, cp, blobs,
+			ctx, conn, sessionID, signals, findings, cp, blobs, msgs,
 		)
 	}
 	// Summary resolution above recorded per-call content-failure
@@ -502,7 +512,7 @@ func (db *DB) replaceSessionContentStaged(
 		if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
 			return err
 		}
-		if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+		if err := invalidateSessionSignalsTx(ctx, tx, sessionID); err != nil {
 			return err
 		}
 	}
@@ -512,7 +522,7 @@ func (db *DB) replaceSessionContentStaged(
 		return err
 	}
 	if cp == nil || blobs == nil {
-		if err := deleteParserCheckpointTx(tx, sessionID); err != nil {
+		if err := deleteParserCheckpointTx(ctx, tx, sessionID); err != nil {
 			return err
 		}
 	} else {

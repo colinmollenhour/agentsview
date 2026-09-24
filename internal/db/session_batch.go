@@ -222,7 +222,7 @@ func (db *DB) WriteSessionBatchContext(
 // WriteSessionBatchAtomic writes all sessions in one
 // transaction. Any rejected or failed row rolls back the whole
 // batch.
-func (db *DB) WriteSessionBatchAtomic(
+func (db *DB) WriteSessionBatchAtomic(ctx context.Context,
 	writes []SessionBatchWrite,
 	beforeCommit ...func() error,
 ) (SessionBatchResult, error) {
@@ -237,7 +237,7 @@ func (db *DB) WriteSessionBatchAtomic(
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return result, fmt.Errorf("beginning batch tx: %w", err)
 	}
@@ -331,13 +331,11 @@ func sanitizeSessionBatchWriteContext(
 		write.UsageEvents[i] = usageEvents[i]
 	}
 
-	msgTotal, msgHasOut, msgPeak, msgHasCtx, err :=
-		batchMessageTokenTotalsContext(ctx, write.Messages)
+	msgTotal, msgHasOut, msgPeak, msgHasCtx, err := batchMessageTokenTotalsContext(ctx, write.Messages)
 	if err != nil {
 		return SessionBatchWrite{}, err
 	}
-	evtTotal, evtHasOut, evtPeak, evtHasCtx, err :=
-		batchUsageEventTokenTotalsContext(ctx, write.UsageEvents)
+	evtTotal, evtHasOut, evtPeak, evtHasCtx, err := batchUsageEventTokenTotalsContext(ctx, write.UsageEvents)
 	if err != nil {
 		return SessionBatchWrite{}, err
 	}
@@ -357,8 +355,7 @@ func sanitizeSessionBatchWriteContext(
 	}
 
 	if totalFromMsgs || peakFromMsgs {
-		total, hasTotal, peak, hasPeak, err :=
-			batchMessageTokenTotalsContext(ctx, write.Messages)
+		total, hasTotal, peak, hasPeak, err := batchMessageTokenTotalsContext(ctx, write.Messages)
 		if err != nil {
 			return SessionBatchWrite{}, err
 		}
@@ -374,8 +371,7 @@ func sanitizeSessionBatchWriteContext(
 	eventTotalNeeded := totalFromEvts && !totalFromMsgs
 	eventPeakNeeded := peakFromEvts && !peakFromMsgs
 	if eventTotalNeeded || eventPeakNeeded {
-		total, hasTotal, peak, hasPeak, err :=
-			batchUsageEventTokenTotalsContext(ctx, write.UsageEvents)
+		total, hasTotal, peak, hasPeak, err := batchUsageEventTokenTotalsContext(ctx, write.UsageEvents)
 		if err != nil {
 			return SessionBatchWrite{}, err
 		}
@@ -460,7 +456,7 @@ func writeOneSessionBatchTx(
 	queries transactionQueries,
 	write SessionBatchWrite,
 	pendingRecallRevocations *recallEvidenceRevocationEvents,
-	preserveAutomation bool,
+	usageOnly bool,
 ) (int, error) {
 	if write.IdentityObservation.Project != "" {
 		normalized, err := normalizeProjectIdentityObservation(
@@ -482,9 +478,10 @@ func writeOneSessionBatchTx(
 	}
 
 	upsertResult, err := upsertSessionExec(
-		queries.Exec,
-		func(query string, args ...any) rowScanner {
-			return queries.QueryRow(query, args...)
+		ctx,
+		tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
 		},
 		write.Session,
 		true,
@@ -560,6 +557,9 @@ func writeOneSessionBatchTx(
 	msgs := write.Messages
 	var pins []savedPin
 	if replaceMessages && sessionExists {
+		if err := reconcileConversationMessagesTx(queries, write.Session.ID, msgs, true, usageOnly); err != nil {
+			return 0, err
+		}
 		pins, err = savePinsTx(queries, write.Session.ID)
 		if err != nil {
 			return 0, err
@@ -573,6 +573,9 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 		msgs = messagesAfterOrdinal(msgs, maxOrd)
+		if err := reconcileConversationMessagesTx(queries, write.Session.ID, msgs, false, usageOnly); err != nil {
+			return 0, err
+		}
 	}
 	transcriptChanged := len(msgs) > 0
 	if replaceMessages && sessionExists {
@@ -626,7 +629,7 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
-	if preserveAutomation {
+	if usageOnly {
 		if err := clearUsageOnlyTextTx(queries, write.Session.ID); err != nil {
 			return 0, err
 		}
@@ -662,7 +665,7 @@ func writeOneSessionBatchTx(
 	}
 	if write.ReplaceMessages {
 		if write.Checkpoint == nil || write.CheckpointBlobs == nil {
-			if err := deleteParserCheckpointTx(tx, write.Session.ID); err != nil {
+			if err := deleteParserCheckpointTx(ctx, tx, write.Session.ID); err != nil {
 				return 0, err
 			}
 		} else {
@@ -698,6 +701,7 @@ func sessionMessagesTx(
 			sessionID, err,
 		)
 	}
+	defer rows.Close()
 	msgs, scanErr := scanMessages(rows)
 	closeErr := rows.Close()
 	if scanErr != nil {

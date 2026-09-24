@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/kit/daemon"
 )
 
@@ -55,14 +56,15 @@ func setStartProbeTickForTest(t *testing.T, tick time.Duration) {
 // as alive until cleanup reaps it.
 func startSleepProcess(t *testing.T) int {
 	t.Helper()
-	return startProcessKilledOnCleanup(t, exec.Command("sleep", "60"))
+	return startProcessKilledOnCleanup(t, exec.CommandContext(t.Context(), "sleep", "60"))
 }
 
 // startTERMIgnoringProcess starts a child that ignores SIGTERM, so it survives
 // a graceful stop and drives the force-kill escalation path.
 func startTERMIgnoringProcess(t *testing.T) int {
 	t.Helper()
-	cmd := exec.Command("sh", "-c", "trap '' TERM; echo ready; exec sleep 60")
+
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", "trap '' TERM; echo ready; exec sleep 60")
 	stdout, err := cmd.StdoutPipe()
 	require.NoError(t, err)
 	require.NoError(t, cmd.Start())
@@ -81,7 +83,8 @@ func startTERMIgnoringProcess(t *testing.T) int {
 // distinguish a running process from one that stopDaemonProcess force-killed.
 func startReapedTERMIgnoringProcess(t *testing.T) (int, <-chan struct{}) {
 	t.Helper()
-	cmd := exec.Command("sh", "-c", "trap '' TERM; echo ready; exec sleep 60")
+
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", "trap '' TERM; echo ready; exec sleep 60")
 	stdout, err := cmd.StdoutPipe()
 	require.NoError(t, err)
 	require.NoError(t, cmd.Start())
@@ -117,7 +120,7 @@ func startProcessKilledOnCleanup(t *testing.T, cmd *exec.Cmd) int {
 // child has been reaped.
 func startReapedSleepProcess(t *testing.T) (int, <-chan struct{}) {
 	t.Helper()
-	cmd := exec.Command("sleep", "60")
+	cmd := exec.CommandContext(t.Context(), "sleep", "60")
 	require.NoError(t, cmd.Start())
 	reaped := make(chan struct{})
 	go func() {
@@ -322,10 +325,10 @@ func holdExternalDaemonStartLock(t *testing.T, dataDir string) func() {
 	unlock := func() {
 		once.Do(func() {
 			_ = stdin.Close()
-			deadline := time.Now().Add(5 * time.Second)
-			for isExternalDaemonStarting(dataDir) && time.Now().Before(deadline) {
-				time.Sleep(10 * time.Millisecond)
-			}
+			require.Eventually(t, func() bool {
+				return !isExternalDaemonStarting(dataDir)
+			}, 5*time.Second, 10*time.Millisecond,
+				"external daemon start lock should be released")
 		})
 	}
 	t.Cleanup(unlock)
@@ -334,7 +337,8 @@ func holdExternalDaemonStartLock(t *testing.T, dataDir string) func() {
 
 func startExternalDaemonStartLockHelper(t *testing.T, dataDir string) io.Closer {
 	t.Helper()
-	cmd := exec.Command(
+
+	cmd := exec.CommandContext(t.Context(),
 		os.Args[0],
 		"-test.run=^TestHoldExternalDaemonStartLockHelperProcess$",
 	)
@@ -395,7 +399,8 @@ func startExternalBackgroundLaunchLockHelper(
 	dataDir string,
 ) io.Closer {
 	t.Helper()
-	cmd := exec.Command(
+
+	cmd := exec.CommandContext(t.Context(),
 		os.Args[0],
 		"-test.run=^TestHoldExternalBackgroundLaunchLockHelperProcess$",
 	)
@@ -478,6 +483,7 @@ func TestHoldExternalBackgroundLaunchLockHelperProcess(t *testing.T) {
 
 func serverEndpoint(t *testing.T, ts *httptest.Server) testDaemonEndpoint {
 	t.Helper()
+
 	u, err := url.Parse(ts.URL)
 	require.NoError(t, err)
 	host, portText, err := net.SplitHostPort(u.Host)
@@ -726,7 +732,7 @@ func TestWriteDaemonRuntimeFailurePreservesUpdateLaunchArgs(t *testing.T) {
 	require.NoError(t, os.Mkdir(runtimePath, 0o700))
 
 	_, err = WriteDaemonRuntimeWithAuthAndNoSync(
-		dir, host, port, "test", "https://viewer.example/base", false, true, true,
+		dir, host, port, "test", "https://viewer.example/base", false, true, true, new(port),
 	)
 	require.Error(t, err)
 
@@ -742,14 +748,16 @@ func TestWriteDaemonRuntimeFailurePreservesUpdateLaunchArgs(t *testing.T) {
 	assert.True(t, state.NoSync)
 
 	oldStop := stopDaemonRuntimeForUpgrade
-	stopDaemonRuntimeForUpgrade = func(_ config.Config, _ *DaemonRuntime) error { return nil }
+	stopDaemonRuntimeForUpgrade = func(ctx context.Context, _ config.Config, _ *DaemonRuntime) error { return nil }
 	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = oldStop })
-	result, err := stopWritableDaemonsForUpdate(config.Config{DataDir: dir})
+	result, err := stopWritableDaemonsForUpdate(t.Context(), config.Config{DataDir: dir})
 	require.NoError(t, err)
 	assert.True(t, result.Stopped)
 	args := restartDaemonAfterUpdateArgs(config.Config{}, result)
 	assert.Contains(t, args, "--require-auth")
 	assert.Contains(t, args, "--no-sync")
+	assert.Contains(t, args, "--port")
+	assert.NotContains(t, args, "--restart-port")
 }
 
 func TestWriteDaemonRuntimeFailurePreservesManagedCaddyIdentity(t *testing.T) {
@@ -765,7 +773,7 @@ func TestWriteDaemonRuntimeFailurePreservesManagedCaddyIdentity(t *testing.T) {
 	require.True(t, ok)
 
 	_, err = WriteDaemonRuntimeWithAuthAndNoSync(
-		dir, host, port, "test", "", false, false, false, os.Getpid(),
+		dir, host, port, "test", "", false, false, false, nil, os.Getpid(),
 	)
 	require.Error(t, err)
 
@@ -807,13 +815,13 @@ func TestStopWritableDaemonsForUpdateIgnoresStaleWritableRecordBeforeFallback(t 
 
 	oldStop := stopDaemonRuntimeForUpgrade
 	var stopped *DaemonRuntime
-	stopDaemonRuntimeForUpgrade = func(_ config.Config, rt *DaemonRuntime) error {
+	stopDaemonRuntimeForUpgrade = func(ctx context.Context, _ config.Config, rt *DaemonRuntime) error {
 		stopped = rt
 		return nil
 	}
 	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = oldStop })
 
-	result, err := stopWritableDaemonsForUpdate(config.Config{DataDir: dir})
+	result, err := stopWritableDaemonsForUpdate(t.Context(), config.Config{DataDir: dir})
 	require.NoError(t, err)
 	require.NotNil(t, stopped)
 	assert.True(t, result.Stopped)
@@ -971,6 +979,7 @@ func rewriteLegacyState(
 	mutate func(*legacyStateFile),
 ) {
 	t.Helper()
+
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	var state legacyStateFile
@@ -986,7 +995,7 @@ func TestWriteAndRemoveDaemonRuntime(t *testing.T) {
 	endpoint := newPingDaemon(t)
 
 	path, err := WriteDaemonRuntimeWithAuthAndNoSync(
-		dir, endpoint.Host, endpoint.Port, "1.0.0", "", false, true, true,
+		dir, endpoint.Host, endpoint.Port, "1.0.0", "", false, true, true, nil,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, runtimePathForTest(dir, os.Getpid()), path)
@@ -1626,8 +1635,8 @@ func TestWritableDaemonRecordsReportsMismatchedRecordRemovalFailure(
 	)
 	assert.Nil(t, records)
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "remove mismatched daemon runtime record")
-	assert.ErrorContains(t, err, path)
+	require.ErrorContains(t, err, "remove mismatched daemon runtime record")
+	require.ErrorContains(t, err, path)
 	assert.FileExists(t, path, "failed cleanup must leave the record recoverable")
 }
 
@@ -1762,4 +1771,38 @@ func TestDaemonRuntime_ReadOnlyPersisted(t *testing.T) {
 	assert.Equal(t, "true", rec.Metadata[runtimeReadOnly])
 	assert.Equal(t, strconv.Itoa(port), rec.Metadata[runtimePort])
 	assert.Equal(t, "test", rec.Version)
+}
+
+func TestBasePathDaemonDiscoveryAndAPITransport(t *testing.T) {
+	for _, token := range []string{"", "test-token"} {
+		t.Run(token, func(t *testing.T) {
+			ts := httptest.NewUnstartedServer(nil)
+			cfg := config.Config{
+				Host: "127.0.0.1", Port: ts.Listener.Addr().(*net.TCPAddr).Port,
+				RequireAuth: token != "", AuthToken: token,
+			}
+			srv := server.New(cfg, nil, nil, server.WithBasePath("/viewer/"))
+			ts.Config.Handler = srv.Handler()
+			ts.Start()
+			defer ts.Close()
+			ep := serverEndpoint(t, ts)
+			dir := t.TempDir()
+			_, err := WriteDaemonRuntimeWithAuth(dir, ep.Host, ep.Port, "test", "https://viewer.example/viewer", true, token != "")
+			require.NoError(t, err)
+			rt := FindDaemonRuntime(dir, token)
+			require.NotNil(t, rt, "prefixed daemon must be discoverable")
+			tr := transportFromRuntime(rt)
+			assert.Equal(t, ts.URL+"/viewer", tr.URL)
+			assert.Equal(t, "https://viewer.example/viewer", tr.BrowserURL)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, tr.URL+"/api/ping", nil)
+			require.NoError(t, err)
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
+			resp, err := ts.Client().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+	}
 }

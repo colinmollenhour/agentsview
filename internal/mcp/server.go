@@ -129,10 +129,13 @@ func newServer(opts ServeOptions) *mcp.Server {
 			"configured, prefer mode hybrid (semantic similarity plus keywords) or semantic for finding " +
 			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
 			"If these modes report not available, use search_sessions for keywords or this tool with " +
-			"substring/regex for exact error messages, identifiers, and code fragments. " +
+			"substring/regex for exact error messages, identifiers, and code fragments, or terms when every " +
+			"literal term must occur within one user/assistant exchange. " +
 			"The default mode remains substring. Set context to include N messages of " +
 			"surrounding conversation with each match. Matches from the last 10 minutes (including the " +
-			"current conversation) are excluded unless include_active is set.",
+			"current conversation) are excluded unless include_active is set; current_session_id replaces " +
+			"that heuristic with one exact exclusion. One-shot and automated " +
+			"sessions are excluded by default; set include_one_shot or include_automated to include them.",
 		Annotations: readOnly,
 	}, t.searchContent)
 
@@ -219,7 +222,7 @@ func isCleanStdioShutdown(err error) bool {
 // calls can finish. addr must already be validated as a safe bind
 // address (see the cmd layer's loopback guard).
 func ServeHTTP(ctx context.Context, opts ServeOptions, addr string) (result error) {
-	listener, err := net.Listen("tcp", addr)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}

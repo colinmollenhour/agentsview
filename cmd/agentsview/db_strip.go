@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"strings"
@@ -105,7 +106,7 @@ func newDBImageCommand(
 func previewDBStrip(
 	ctx context.Context, cfg config.Config, filter db.StripImagesFilter,
 ) (db.StripImagesReport, error) {
-	database, err := openReadOnlyDB(cfg)
+	database, err := openReadOnlyDB(ctx, cfg)
 	if err != nil {
 		return db.StripImagesReport{}, fmt.Errorf("opening archive for image strip preview: %w", err)
 	}
@@ -136,7 +137,7 @@ func writeDBImageReport(
 	out io.Writer, report db.StripImagesReport, jsonOutput bool, heading string,
 ) error {
 	if jsonOutput {
-		return json.NewEncoder(out).Encode(report)
+		return json.MarshalEncode(jsontext.NewEncoder(out), report)
 	}
 	fmt.Fprintln(out, heading)
 	fmt.Fprintf(out, "  Sessions: %d\n", report.Sessions)

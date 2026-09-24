@@ -24,6 +24,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/poller"
 	"go.kenn.io/agentsview/internal/recall/extract"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/secrets"
@@ -131,7 +132,7 @@ func applyServeMemoryLimit() {
 	debug.SetMemoryLimit(serveMemoryLimitBytes)
 }
 
-func runServe(cfg config.Config, opts serveOptions) {
+func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restartPort int) {
 	start := time.Now()
 	setupLogFile(cfg.DataDir)
 	applyServeMemoryLimit()
@@ -155,7 +156,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		}
 	}
 
-	cont, releaseForegroundServeLaunch, err := prepareForegroundServeDaemon(
+	cont, releaseForegroundServeLaunch, err := prepareForegroundServeDaemon(ctx,
 		&cfg,
 		serveReplacementOptions{
 			Replace:        opts.ReplaceDaemon,
@@ -182,7 +183,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 	// waitForServerRuntime before defers unwind, so registering stop here
 	// (rather than after the DB defer) does not affect shutdown ordering.
 	ctx, stop := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM,
+		ctx, os.Interrupt, syscall.SIGTERM,
 	)
 	defer stop()
 
@@ -195,7 +196,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 	var workerStartupResult workerResult
 	workerSyncDone := false
 	if opts.SkipInitialSync && !cfg.NoSync {
-		needsResync, err := db.ArchiveNeedsResync(cfg.DBPath)
+		needsResync, err := db.ArchiveNeedsResync(ctx, cfg.DBPath)
 		if err != nil {
 			fatal("checking archive before startup: %v", err)
 		}
@@ -230,8 +231,8 @@ func runServe(cfg config.Config, opts serveOptions) {
 
 	startupProgress.SetPhase("opening database")
 	databaseProgress := newResyncProgressPrinter(os.Stdout, time.Now)
-	database, writeLock, err := openWriteDBWith(context.Background(), cfg, func(cfg config.Config) (*db.DB, error) {
-		return openDBWithProgress(cfg, func(p db.OpenProgress) {
+	database, writeLock, err := openWriteDBWith(ctx, cfg, func(ctx context.Context, cfg config.Config) (*db.DB, error) {
+		return openDBWithProgress(ctx, cfg, func(p db.OpenProgress) {
 			if p.ResyncRequired {
 				fmt.Println(p.Detail)
 			} else {
@@ -319,7 +320,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 	var completeWorkerStartup func()
 	if !cfg.NoSync {
 		var onStartupReconciled func(sync.SyncStats, error)
-		engine = sync.NewEngine(database, sync.EngineConfig{
+		engine = sync.NewEngine(ctx, database, sync.EngineConfig{
 			AgentDirs:               cfg.AgentDirs,
 			SourceMachines:          cfg.SourceMachines,
 			ProviderMetadata:        cfg.ProviderMetadata,
@@ -408,7 +409,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 				startupProgress.SetPhase("full resync")
 				signalsCovered, _ := runInitialResync(ctx, engine, startupProgress)
 				if ctx.Err() == nil {
-					finishInitialResync(database, signalsCovered)
+					finishInitialResync(ctx, database, signalsCovered)
 				}
 			} else {
 				startupProgress.SetPhase("initial sync")
@@ -453,7 +454,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 
 	identityBackfillEngine := engine
 	if identityBackfillEngine == nil {
-		identityBackfillEngine = sync.NewEngine(database, sync.EngineConfig{
+		identityBackfillEngine = sync.NewEngine(ctx, database, sync.EngineConfig{
 			Machine:            cfg.InstallationID,
 			ScanProtectedPaths: cfg.ScanProtectedPaths,
 			ArchiveContent:     cfg.ArchiveContent,
@@ -476,19 +477,20 @@ func runServe(cfg config.Config, opts serveOptions) {
 	// upsert so the first usage page load does not observe an
 	// empty table; the scheduler's background LiteLLM refresh
 	// follows immediately.
-	var pricingRefreshRunner pricingRefreshExclusiveRunner
+	var pricingRefreshRunner remoteSyncExclusiveRunner
 	if engine != nil {
 		pricingRefreshRunner = engine
 	}
 	seedPricing(database, pricingRefreshRunner)
-	go startPeriodicPricingRefresh(ctx, database, pricingRefreshRunner)
+	scheduler := poller.Start(ctx, pricingRefreshJob(database, pricingRefreshRunner))
+	defer func() {
+		stop()
+		scheduler.Wait()
+	}()
 
-	rtOpts := serveRuntimeOptions{
-		Mode:           "serve",
-		RequestedPort:  cfg.Port,
-		OnCaddyStarted: startupProgress.SetCaddyProcess,
-	}
-	preparedCfg, prepErr := prepareServeRuntimeConfig(cfg, rtOpts)
+	preparedCfg, rtOpts, prepErr := prepareRunServeRuntimeConfig(ctx,
+		cfg, restartPort, startupProgress.SetCaddyProcess,
+	)
 	if prepErr != nil {
 		fatal("%v", prepErr)
 	}
@@ -507,6 +509,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		server.WithHTTPRemoteCleanupRegistry(httpRemoteCleanupRegistry),
 		server.WithPprof(opts.Pprof),
 	}
+	srvOpts = append(srvOpts, pushBackendOptions()...)
 	srvOpts = append(srvOpts, vectorServe.ServerOpts...)
 	if src := newVectorPushSource(cfg); src != nil {
 		srvOpts = append(srvOpts, server.WithVectorPushSource(src))
@@ -554,9 +557,13 @@ func runServe(cfg config.Config, opts serveOptions) {
 	// write fails, keep the start lock as a fallback "server
 	// is active" marker so token-use doesn't start a competing
 	// on-demand sync against our live DB.
+	var explicitPort *int
+	if rt.Cfg.PortExplicit {
+		explicitPort = new(rtOpts.RequestedPort)
+	}
 	if _, sfErr := writeDaemonRuntimeWithAuthAndNoSync(
 		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, rt.PublicURL, false,
-		rt.Cfg.RequireAuth, rt.Cfg.NoSync,
+		rt.Cfg.RequireAuth, rt.Cfg.NoSync, explicitPort,
 		rt.Caddy.Pid(),
 	); sfErr != nil {
 		reportRuntimeRecordWrite(
@@ -1068,6 +1075,12 @@ func newForegroundResyncRunner(
 					// "aborted" verdict takes this path: operational build
 					// failures report "failed" and must surface their error
 					// rather than masquerade as a successful incremental sync.
+					//
+					// The worker reset its own failure cache. That copy died
+					// with the discarded rebuild, so forget the parent's copy
+					// too. Otherwise previously failed sources stay skipped
+					// and a parser upgrade cannot reach them.
+					engine.ResetFailureCache(ctx)
 					return syncAllReleasingStartupMaintenance(
 						ctx, engine, progress,
 					), nil
@@ -1211,7 +1224,7 @@ func runWorkerResyncBuild(
 		}
 		// The swap's reopen restored the writer and cleared the barrier;
 		// re-baseline the caches that referenced the replaced database.
-		if cerr := engine.ResetCachesAfterSwap(); cerr != nil {
+		if cerr := engine.ResetCachesAfterSwap(ctx); cerr != nil {
 			return cerr
 		}
 		// Record the completed resync with ResyncAll parity before the
@@ -1367,23 +1380,23 @@ func truncateLogFile(path string, limit int64) {
 	_ = os.Truncate(path, 0)
 }
 
-func openDB(cfg config.Config) (*db.DB, error) {
-	return openDBWithProgress(cfg, nil)
+func openDB(ctx context.Context, cfg config.Config) (*db.DB, error) {
+	return openDBWithProgress(ctx, cfg, nil)
 }
 
-func openDBWithProgress(cfg config.Config, progress db.OpenProgressFunc) (*db.DB, error) {
-	if err := clearUsageOnlyVectors(context.Background(), cfg); err != nil {
+func openDBWithProgress(ctx context.Context, cfg config.Config, progress db.OpenProgressFunc) (*db.DB, error) {
+	if err := clearUsageOnlyVectors(ctx, cfg); err != nil {
 		return nil, err
 	}
 	applyClassifierConfig(cfg)
-	database, err := db.OpenWithProgress(cfg.DBPath, cfg.ArchiveContent, progress)
+	database, err := db.OpenWithProgress(ctx, cfg.DBPath, cfg.ArchiveContent, progress)
 	if err != nil {
 		return nil, err
 	}
 	database.SetToolResultImages(cfg.ToolResultImages)
 	database.SetAssetsDir(filepath.Join(cfg.DataDir, "assets"))
 	if cfg.InstallationID != "" {
-		unowned, err := database.EnsureInstallationIdentity(context.Background(), cfg.InstallationID)
+		unowned, err := database.EnsureInstallationIdentity(ctx, cfg.InstallationID)
 		if err != nil {
 			database.Close()
 			return nil, fmt.Errorf("adopting installation identity: %w", err)
@@ -1395,7 +1408,7 @@ func openDBWithProgress(cfg config.Config, progress db.OpenProgressFunc) (*db.DB
 		}
 	}
 	if cfg.InstallationID != "" && cfg.LocalMachineName != "" {
-		if err := database.SetSyncState(db.MachineLabelKeyPrefix+cfg.InstallationID, cfg.LocalMachineName); err != nil {
+		if err := database.SetSyncState(ctx, db.MachineLabelKeyPrefix+cfg.InstallationID, cfg.LocalMachineName); err != nil {
 			database.Close()
 			return nil, fmt.Errorf("recording installation display name: %w", err)
 		}
@@ -1404,11 +1417,17 @@ func openDBWithProgress(cfg config.Config, progress db.OpenProgressFunc) (*db.DB
 	return database, nil
 }
 
-func openReadOnlyDB(cfg config.Config) (*db.DB, error) {
+func openReadOnlyDB(ctx context.Context, cfg config.Config) (*db.DB, error) {
 	applyClassifierConfig(cfg)
-	database, err := db.OpenReadOnly(cfg.DBPath)
+	database, err := db.OpenReadOnly(ctx, cfg.DBPath)
 	if err != nil {
 		return nil, schemaUpgradeHint(err)
+	}
+	database.SetArchiveContent(cfg.ArchiveContent)
+	if database.NeedsResync() {
+		database.Close()
+		return nil, appendDaemonRestartUpgradeHint(
+			errors.New("opening read-only database: archive data needs resync"))
 	}
 	applyCustomPricing(database, cfg)
 	if err := applyCursorSecret(database, cfg); err != nil {
@@ -1444,6 +1463,21 @@ func daemonRestartUpgradeHint() string {
 		"  - CLI: run `agentsview daemon restart`"
 }
 
+// staleClientUpgradeHint is the counterpart of daemonRestartUpgradeHint for
+// the direction where the daemon has already been upgraded and the process
+// running this command is the one left behind, typically a `pg push
+// --watch` or `duckdb push --watch` started before the upgrade.
+func staleClientUpgradeHint() string {
+	return "The running daemon is newer than this agentsview binary, so " +
+		"this command cannot use it until both run the same version. " +
+		"Restarting the daemon will not help. Upgrade this agentsview " +
+		"install and rerun the command. If this command is a " +
+		"long-running background process started before the upgrade " +
+		"(`pg push --watch`, `duckdb push --watch`, or a service " +
+		"installed with `agentsview pg service`), restart it so it " +
+		"picks up the current binary."
+}
+
 func openWriteDB(
 	ctx context.Context,
 	cfg config.Config,
@@ -1456,7 +1490,7 @@ func openWriteDB(
 // startup can require an ownership choice.
 func openWriteDBWith(
 	ctx context.Context, cfg config.Config,
-	openArchive func(config.Config) (*db.DB, error),
+	openArchive func(context.Context, config.Config) (*db.DB, error),
 ) (*db.DB, *writeOwnerLock, error) {
 	if err := rejectLiveWritableDaemonBeforeDirectWrite(cfg); err != nil {
 		return nil, nil, err
@@ -1475,7 +1509,7 @@ func openWriteDBWith(
 			"recovering interrupted archive compaction: %w", err,
 		)
 	}
-	database, err := openArchive(cfg)
+	database, err := openArchive(ctx, cfg)
 	if err != nil {
 		_ = lock.Close()
 		return nil, nil, err
@@ -1499,17 +1533,15 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 	}
 	dataDir := writeLockDataDir(cfg)
 	if isExternalDaemonStarting(dataDir) || isLegacyDaemonStarting(dataDir) {
-		return fmt.Errorf(
-			"local daemon is starting and owns the SQLite archive; " +
-				"refusing to write directly. Retry once it is ready",
+		return errors.New("local daemon is starting and owns the SQLite archive; " +
+			"refusing to write directly. Retry once it is ready",
 		)
 	}
 	if isBackgroundLaunchActive(dataDir) &&
 		!ownsForegroundServeLaunchLock(dataDir) &&
 		!runningAsBackgroundChild() {
-		return fmt.Errorf(
-			"local daemon launch is in progress and owns the SQLite archive; " +
-				"refusing to write directly. Retry once it is ready",
+		return errors.New("local daemon launch is in progress and owns the SQLite archive; " +
+			"refusing to write directly. Retry once it is ready",
 		)
 	}
 	if !hasLiveWritableDaemonRuntime(dataDir, cfg.AuthToken) {
@@ -1673,10 +1705,10 @@ func runInitialResync(
 }
 
 type signalsBackfillMarker interface {
-	MarkSignalsBackfillDone() error
+	MarkSignalsBackfillDone(ctx context.Context) error
 }
 
-func finishInitialResync(
+func finishInitialResync(ctx context.Context,
 	marker signalsBackfillMarker, signalsCovered bool,
 ) {
 	// Only short-circuit BackfillSignals when resync rewrote every
@@ -1687,7 +1719,7 @@ func finishInitialResync(
 	if !signalsCovered {
 		return
 	}
-	if err := marker.MarkSignalsBackfillDone(); err != nil {
+	if err := marker.MarkSignalsBackfillDone(ctx); err != nil {
 		log.Printf("mark signals backfill done: %v", err)
 	}
 }
@@ -2380,17 +2412,23 @@ type watchSyncer = sync.WatchBatchSyncer
 // The daemon queues the batch on the watcher before opening dispatch so the
 // affected roots re-reconcile with backoff.
 func gapReconciliationRetryBatch(gapErr error) sync.WatchBatch {
-	var pathsSource interface{ ReconciliationRetryPaths() []string }
-	var rootsSource interface{ ReconciliationRetryRoots() []string }
-	var overflowSource interface{ ReconciliationRetryOverflow() bool }
 	var paths, roots []string
-	if errors.As(gapErr, &pathsSource) {
+	if pathsSource, ok := errors.AsType[interface {
+		error
+		ReconciliationRetryPaths() []string
+	}](gapErr); ok {
 		paths = deduplicateStrings(pathsSource.ReconciliationRetryPaths())
 	}
-	if errors.As(gapErr, &rootsSource) {
+	if rootsSource, ok := errors.AsType[interface {
+		error
+		ReconciliationRetryRoots() []string
+	}](gapErr); ok {
 		roots = deduplicateStrings(rootsSource.ReconciliationRetryRoots())
 	}
-	if errors.As(gapErr, &overflowSource) && overflowSource.ReconciliationRetryOverflow() {
+	if overflowSource, ok := errors.AsType[interface {
+		error
+		ReconciliationRetryOverflow() bool
+	}](gapErr); ok && overflowSource.ReconciliationRetryOverflow() {
 		return sync.WatchBatch{FullSync: true}
 	}
 	if len(paths) > 0 || len(roots) > 0 {
@@ -3070,7 +3108,7 @@ func remoteHostSyncFunc(
 ) func() (int, error) {
 	return func() (int, error) {
 		if runner == nil {
-			return 0, fmt.Errorf("scheduled remote sync missing exclusive runner")
+			return 0, errors.New("scheduled remote sync missing exclusive runner")
 		}
 		runExclusive := func() (remotesync.SyncStats, error) {
 			var stats remotesync.SyncStats

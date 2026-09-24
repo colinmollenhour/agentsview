@@ -321,11 +321,17 @@ add an archived or maintained mirror without replacing the original identity.
   `tool-results/` directory and, for subagents, the enclosing parent session's
   `tool-results/` directory. These immutable companions are captured with the
   appendable transcript so a reconstructed tree preserves the parser's
-  physical inputs. Reverified 2026-09-10 that hosted tool parsing derives
-  skill names from recorded paths without consulting worker-local `SKILL.md`
-  frontmatter or the local parse cache; local parsing retains frontmatter
-  lookup. `TestHostedSkillInferenceKeepsNamesLexical` covers this boundary.
-  Reverified 2026-08-22 against local sessions launched from repository-local
+  physical inputs. Reverified 2026-09-16 against the persisted-output reader
+  and `TestClaudePersistedToolResultUTF8`: the 16 MiB display cap backs up to
+  a UTF-8 boundary before appending its truncation notice. This is an
+  Agentsview limit, not a producer-format limit. The shared first-message
+  preview helper retains its rune-count limit, whitespace trimming, and
+  trailing `...`, as covered by `TestTruncateRespectsRuneBoundaries`. Reverified
+  2026-09-10 that hosted tool parsing derives skill names from recorded paths
+  without consulting worker-local `SKILL.md` frontmatter or the local parse
+  cache; local parsing retains frontmatter lookup.
+  `TestHostedSkillInferenceKeepsNamesLexical` covers this boundary. Reverified
+  2026-08-22 against local sessions launched from repository-local
   `REPO/.claude/worktrees/<generated-name>` worktrees: the transcript retains
   the generated worktree path after that checkout is deleted, so Agentsview
   recognizes the anchored layout and attributes it to `REPO`. Evidence remains
@@ -417,6 +423,28 @@ add an archived or maintained mirror without replacing the original identity.
   legacy fallback, and `session_id` identifies the root or tree rather than
   the parent.
 
+- **Automation (reverified 2026-09-19):** `session_meta.payload.originator` of
+  `codex_exec` is durable producer evidence of a non-interactive `codex exec`
+  invocation. Agentsview persists that as `session_kind = non-interactive` so
+  every exec session is automated, including one-shots whose first message
+  does not match a built-in prefix. When `thread_source` is `roborev` (from
+  `codex exec --thread-source roborev`), Agentsview stores
+  `session_kind = roborev` instead so roborev reviews stay identifiable as
+  code review while remaining automated. Native `spawn_agent` children still
+  use `source.subagent` plus `parent_thread_id` for
+  `relationship_type = subagent`; do not pass `--thread-source subagent` from
+  roborev. Reverified against an isolated
+  `codex-proxy exec --thread-source roborev` rollout.
+
+- **apply_patch file paths (2026-09-21):** Issue
+  [#1899](https://github.com/kenn-io/agentsview/issues/1899) reports that
+  `apply_patch` calls carry no `file_path`, so file-keyed views such as Recent
+  Edits omit every Codex edit. The patch body names each touched file with
+  `*** Add File:`, `*** Update File:`, `*** Delete File:`, or `*** Move to:`
+  markers; Agentsview maps those to `tool_calls.file_path` and emits one tool
+  call per file. `custom_tool_call` items carry the same patch text under
+  `input` instead of a JSON `patch` argument.
+
 - **Evidence:** `source`.
 
 - **Upstream:** Clone `https://github.com/openai/codex.git` at
@@ -476,8 +504,17 @@ add an archived or maintained mirror without replacing the original identity.
 
 - **Agentsview:** `internal/parser/codex.go` and
   `internal/parser/codex_provider.go`; usage is taken from the last-turn
-  counters rather than repeatedly counting cumulative totals. Fork and
-  subagent rollouts can begin with a re-stamped copy of the parent's
+  counters rather than repeatedly counting cumulative totals. Reverified
+  2026-09-20 against the pinned protocol types and
+  `TestCodexUserTextMixedInjectedBlocks`: recognized injected context is
+  removed per user text block before storage and prompt classification.
+  Prompts survive when context comes before or after them, with or without a
+  recommended-plugins envelope. Ordinary prose quoting an envelope remains
+  unchanged. Data version 113 triggers the normal full resync so unchanged
+  sources update stored content, first-message previews, and user-message
+  counts. `TestCodexUserTextUpgradeReparsesUnchangedSource` covers archives at
+  versions 111 and 112 and verifies that source-less sessions survive. Fork
+  and subagent rollouts can begin with a re-stamped copy of the parent's
   transcript, including its `token_count` records. Agentsview follows the
   explicit parent id, compares the ordered `turn_context.turn_id` sequence as
   opaque identifiers, and discards the leading turns also present in the
@@ -637,6 +674,82 @@ add an archived or maintained mirror without replacing the original identity.
   `internal/parser/traex.go`: the shared Codex parser produces the same
   unmarked legacy notification rows. Transcript-only archive copies apply the
   same pre-version-100 user-row removal as Codex.
+
+## Augure Code (`augure-code`)
+
+- **Format:** Codex-compatible rollout JSONL under a dated `YYYY/MM/DD` tree at
+  `~/.augure/sessions` (one home-relative root on all platforms). Newer
+  rollouts add a top-level `ordinal` on every record; older files omit it. The
+  `event_msg:thread_settings_applied` record carries the applied
+  `model`/`reasoning_effort`/provider id, while `turn_context` remains the
+  parser's model source. No `archived_sessions/` directory, `history.jsonl`,
+  or `session_index.jsonl` sidecar has been observed under `~/.augure`.
+- **Evidence:** `no-public-source`.
+- **Upstream:** Augure publishes no producer source; https://augureai.ca was
+  checked 2026-09-11 and offers no public repo. The equivalence to Codex rests
+  on local Augure CLI 1.0.2-1.0.6 rollouts with `originator: "codex-tui"`,
+  `rate_limits.limit_id: "codex"`, Codex field shapes throughout
+  (`session_meta`, `response_item`, `event_msg:token_count`, `turn_context`),
+  plus Augure's own `legacy_migration.json` documenting a one-time import from
+  a stock `~/.codex` layout, which identifies it as a fork of the evidenced
+  codex-rs recorder rather than an independent format. A de-identified rollout
+  is retained as a fixture. The companion `~/.augure/state_5.sqlite` and
+  `thread_history_1.sqlite` projection databases are redundant for parsing and
+  are deliberately not consumed; their `_sqlx_migrations` bookkeeping tables
+  are not format markers.
+- **Usage and cost:** `token_count` records carry the Codex fields, so
+  normalization follows the Codex entry. Models observed are proprietary
+  Augure slugs (`ossington-5`, `ossington-4-1`, `rosedale-1`) absent from the
+  pricing catalog, so their events price as unpriced until catalog coverage
+  appears.
+- **Agentsview:** `internal/parser/augure.go` relabels the shared Codex parser
+  (`internal/parser/codex.go`, `internal/parser/codex_provider.go`) onto the
+  `augure-code:` ID namespace, and `internal/sync` gates the format-shaped
+  branches on `isCodexFormatAgent`. The `session_index.jsonl` and S3 branches
+  stay Codex-only because Augure Code writes no index file and has no archive
+  layout.
+- **Archive projection (2026-09-13):** Augure Code sessions share the Codex
+  unmarked-notification shape, so the archive curation user-row removal that
+  covers Codex and TraeX also covers `augure-code`.
+
+## Augure Desktop v3 (`augure-desktop`)
+
+- **Format:** Hermes Agent state.db schema at `~/.augure-desktop/state.db`
+  (`sessions`, `messages`, `messages_fts*`, `session_model_usage`,
+  `session_turn_leases`, `gateway_routing`, `async_delegations`,
+  `compression_locks`, `system_prompts`, `state_meta`, `schema_version`) plus
+  the `sessions/` transcript sibling. Timestamps are REAL epoch seconds;
+  observed rows carry `source = "desktop"`. Hermes-style (`20260910_075655_ca54ab`)
+  and UUID session ids coexist in one store.
+- **Evidence:** `no-public-source`.
+- **Upstream:** The app is closed and publishes no producer source; it was
+  checked 2026-09-11. Its `install-stamp.json` names branch
+  `release/desktop-v3-candidate`, commit `d419438f`, built 2026-09-09 (Augure
+  Desktop 3.0.0-beta.7). The data root comes from the bundled
+  `hermes_constants.py`: `DEFAULT_HERMES_HOME_DIRNAME = ".augure-desktop"`,
+  `DEFAULT_HERMES_HOME_DIRNAME_WINDOWS = "augure-desktop"`,
+  `LEGACY_HERMES_HOME_DIRNAME = ".hermes"`, plus a 340-file `hermes_*` Python
+  runtime in the app bundle, identifying a Hermes Agent fork. The fork's
+  `schema_version` was 26 the same day stock `~/.hermes/state.db` measured 30:
+  same table family, independent version lines. The fork marker is the
+  store's own root name (`.augure-desktop` / `%LOCALAPPDATA%\augure-desktop`),
+  never the schema shape or `schema_version` number.
+- **Usage and cost:** the state DB's own authoritative session columns
+  (`input_tokens`, `output_tokens`, cache columns, `reasoning_tokens`,
+  `estimated_cost_usd`, `actual_cost_usd`, `cost_status`, `cost_source`),
+  decoded exactly like stock Hermes: `actual_cost_usd` 0 (SQL 0, not NULL) is
+  a present-zero, estimated 0 does not masquerade as $0. Models observed are
+  proprietary Augure slugs (`ossington-5`), absent from the pricing catalog,
+  so their events price as unpriced until catalog coverage appears.
+- **Agentsview:** `internal/parser/augure_desktop.go` relabels the shared
+  Hermes provider (`internal/parser/hermes.go`,
+  `internal/parser/hermes_provider.go`) onto the `augure-desktop:` ID prefix
+  through the `hermesProviderSpec` seam; `internal/sync` treats it like Hermes
+  for fingerprint-hash freshness and provider fingerprint file info. The
+  default roots are marker-named, which keeps default discovery disjoint
+  from Hermes without a runtime gate; explicitly configured roots are
+  accepted as given (TraeX precedent). Remote sync is excluded for the same
+  raw-state.db/WAL reasons the registry entry documents.
 
 ## GitHub Copilot CLI (`copilot`)
 
@@ -836,6 +949,24 @@ add an archived or maintained mirror without replacing the original identity.
   session-associated file as durable automation evidence; file presence, a
   missing field, or a missing file does not classify a session as automated.
 
+- **Subagent attribution (reverified 2026-09-18):** Grok Build stores each
+  `spawn_subagent` child as a sibling session directory in the normal sessions
+  tree. The parent also writes `subagents/<id>/meta.json` with
+  `parent_session_id`, `child_session_id` (equal to `subagent_id`), and
+  optional `resumed_from`. The child is not nested under `subagents/`. A
+  worktree-isolated child can land in a different encoded cwd group;
+  `meta.json` still lives under the parent. Child `summary.json` uses
+  `session_kind` values `subagent`, `subagent_resume`, or `subagent_fork`.
+  `summary.json` `parent_session_id` remains the source session for a fork or
+  restore, including resume-from copies that point at the previous child
+  rather than the spawning parent. Agentsview parents a child from the parent's
+  `meta.json` as `relationship_type = 'subagent'` with parent id
+  `grok:<parent-id>`, and keeps fork or restore sessions that only have
+  `parent_session_id` as `fork`. Spawn tool results that include `subagent_id`
+  attach that child on the parent's `spawn_subagent` call. Reverified against
+  the pinned session guide (`17-sessions.md`) and the `SubagentMeta` writer in
+  `xai-grok-shell` at the commit above.
+
 - **Agentsview:** `internal/parser/grok.go`, `internal/parser/grok_provider.go`,
   colocated tests, and the sanitized upstream-generated fixtures in
   `internal/parser/testdata/grok-build`.
@@ -883,6 +1014,10 @@ add an archived or maintained mirror without replacing the original identity.
   [session history](https://github.com/alibaba/open-code-review/blob/966f976e24b09e2a3691d3919c9833adcd03642f/internal/session/history.go).
   The public issue sample was also preserved as a sanitized fixture in the
   AgentsView parser tests.
+- **Usage encoding reverified (2026-09-16):** The pinned session history
+  declares prompt, completion, cache-read, and cache-write token fields.
+  AgentsView serializes their normalized map with sorted keys so reparsing
+  unchanged usage preserves the bytes used by message comparison.
 - **Reverified (2026-09-10):** Checked the pinned writer and history code plus
   [tool execution](https://github.com/alibaba/open-code-review/blob/966f976e24b09e2a3691d3919c9833adcd03642f/internal/llmloop/loop.go)
   and
@@ -1300,6 +1435,10 @@ schemas keep their existing ordering behavior.
   `internal/parser/kilo_legacy_provider.go`; the parser borrows RooCode's
   Cline message handling (tool-call pairing, reasoning, compact boundaries,
   error linking). New sessions stopped after the OpenCode migration.
+  Reverified 2026-09-16 against the parser and
+  `TestKiloLegacySessionNameUTF8`: Agentsview derives the display title from
+  the first user message and clips it on a UTF-8 boundary within the existing
+  80-byte budget, including `...`. This does not change the recorded format.
 
 ## Roo Code (`roocode`)
 
@@ -1548,6 +1687,18 @@ schemas keep their existing ordering behavior.
   update (3.16.29) has shrunk or wiped some users' `cursorDiskKV` rows, so the
   parser tolerates a `fullConversationHeadersOnly` entry whose `bubbleId` row
   is missing rather than failing the whole session.
+- **Tool results:**
+  [Issue #1798](https://github.com/kenn-io/agentsview/issues/1798) supplies
+  one redacted `todo_write` bubble with an object-valued
+  `toolFormerData.result`, rechecked 2026-09-16. The Cursor version is
+  unconfirmed. The checked-in
+  `internal/parser/testdata/cursor-ide-object-tool-result.json` replaces the
+  capture placeholders with synthetic values and keeps `rawArgs` and `params`
+  as JSON-encoded strings. This sample establishes the object shape only, with
+  no frequency or all-version claim. The parser preserves the existing string
+  result text and renders other valid non-null JSON values as raw JSON text.
+  Absent, null, and empty-string results emit no tool result. Nonempty
+  malformed bubble JSON still errors.
 - **NULL values:**
   [Issue #1676](https://github.com/kenn-io/agentsview/issues/1676) (reported
   2026-09-08; rechecked 2026-09-10) records 64 SQL NULL values among 2,189
@@ -1643,7 +1794,9 @@ schemas keep their existing ordering behavior.
   `toolSpecificData.commandLine.original`, and ordered `inlineReference`
   response items. Agentsview consumes the final response array, which also
   preserves display order, rather than the duplicate tool calls under
-  `result.metadata.toolCallRounds`.
+  `result.metadata.toolCallRounds`. Each assistant message records the model
+  that served its turn (`result.metadata.resolvedModel`, falling back to the
+  request's prefixed `modelId`).
 
 ## Windsurf (`windsurf`)
 
@@ -1747,7 +1900,23 @@ schemas keep their existing ordering behavior.
   conversation. Reverified 2026-09-03 against 156 local Pi transcripts: the
   parser attributed 1,316 `read` calls whose `path` or `file_path` named a
   concrete `SKILL.md`, while shell commands that only mentioned the filename
-  without reading it stayed unattributed.
+  without reading it stayed unattributed. Reverified 2026-09-14 against the
+  pinned
+  [session format](https://github.com/earendil-works/pi/blob/f1c587dde39025c75d7397bc14532d8fa5c001d9/packages/coding-agent/docs/session-format.md)
+  and
+  [session manager](https://github.com/earendil-works/pi/blob/f1c587dde39025c75d7397bc14532d8fa5c001d9/packages/coding-agent/src/core/session-manager.ts):
+  native Pi persists the parent of `/fork`, `/clone`, and
+  `newSession({ parentSession })` sessions as a `parentSession` file path to
+  the parent transcript, whose header UUID is authoritative even where the
+  filename stem diverges (explicit `--session` paths skip the default
+  `timestamp_session-id` naming). Agentsview resolves that path against the
+  referenced sibling's header UUID, falls back to the filename stem when the
+  referenced file is unavailable, and classifies native Pi sessions with a
+  parent as forks. Because the default filename does not contain the header
+  UUID, identity lookup that arrives with only a bare header UUID and no
+  stored path or fingerprint hint scans discovered session headers after the
+  filename and directory lookups miss. Data version 109 reparses stored native
+  Pi sessions to repair lineage edges and fork classification.
 
 ## Prime Agent (`prime-agent`)
 
@@ -1877,21 +2046,30 @@ schemas keep their existing ordering behavior.
 
 ## DeepSeek Harness (`deepseek-harness`)
 
-- **Format:** Agentsview reads version `0` session JSONL under
-  `<sessions-root>/<project>/<encoded-session-id>/session.jsonl`, or the
-  default checksummed multi-frame zstd encoding at `session.jsonl.zstd`. The
-  immutable header records session identity, cwd, creation time, seed lineage,
-  delegation origin, and agent preset. Event rows carry a contiguous `seq`;
-  runs of assistant deltas may use the `text-chunks`, `reasoning-chunks`, and
-  `tool-call-chunks` packed storage rows. Session IDs are arbitrary non-empty
-  strings and are injectively encoded before use as a directory name. A
-  sessions root belongs to one physical encoding; the upstream backend rejects
-  an opposite-suffix artifact rather than providing mixed-root fallback or
-  migration. `sourceEventSeqs` uses non-negative safe integers and inclusive
-  `[start, end]` ranges, mixed entry by entry: `[[138, 144]]` represents seven
-  sequences. This is intentional storage compression, introduced in upstream
-  commit
+- **Format:** Released session generations `0` through `3` are stored as JSONL
+  under `<sessions-root>/<project>/<encoded-session-id>/`. Generation zero
+  uses the suffix-only `session.jsonl` (or the default checksummed multi-frame
+  zstd encoding at `session.jsonl.zstd`); generation `N > 0` carries a
+  lowercase numeric component at `session.vN.jsonl[.zstd]`. One session
+  directory can retain several immutable generations; the numerically newest
+  canonical generation is current. The immutable header records session
+  identity, cwd, creation time, seed lineage, delegation origin, and agent
+  preset. Event rows carry a contiguous `seq`. Generations 0 and 1 may encode
+  runs of assistant deltas with the `text-chunks`, `reasoning-chunks`, and
+  `tool-call-chunks` packed storage rows, and their `sourceEventSeqs` uses
+  non-negative safe integers and inclusive `[start, end]` ranges, mixed entry
+  by entry: `[[138, 144]]` represents seven sequences. This provenance
+  compression was introduced in upstream commit
   [df76bc6](https://github.com/deepseek-ai/deepseek-harness/commit/df76bc695b4bdff093369ab22a506cd37ca087c1).
+  Generation 2 embeds the timed assistant stream in `assistant/message` and
+  records settled non-surface attempts as `assistant/attempt`; generation 3
+  additionally promotes the system prompt to a `system/message` surface event,
+  renames the PTC dispatch tags to `tool/ptc-dispatch[-start]`, and spells
+  replacement coordinates as `startSeq`/`endSeq`. Session IDs are arbitrary
+  non-empty strings and are injectively encoded before use as a directory
+  name. A sessions root belongs to one physical encoding; the upstream backend
+  rejects an opposite-suffix artifact rather than providing mixed-root
+  fallback or migration.
 
 - **Evidence:** `source`.
 
@@ -1939,36 +2117,41 @@ schemas keep their existing ordering behavior.
 
 - **Agentsview:** `internal/parser/deepseek_harness.go`,
   `internal/parser/deepseek_harness_format.go`, and
-  `internal/parser/deepseek_harness_provider.go`. Only events at or after a
-  child's `seedLength` contribute transcript rows and usage, while the full
-  log remains available to validate event and turn/step structure and fold the
-  latest title and agent preset. Surface replacements are excluded from the
-  human transcript, and a chunk-only live response is positioned from its
+  `internal/parser/deepseek_harness_provider.go`. Released generations 0
+  through 3 are accepted, and discovery prefers the newest canonical
+  generation in a session directory. Only events at or after a child's
+  inherited cut contribute transcript rows and usage, while the full log
+  validates event and turn/step structure and folds the latest title and agent
+  preset. Surface replacements are excluded from the human transcript; a
+  chunk-only generation-0 or generation-1 live response is positioned from its
   first assistant chunk and reconstructed until a final assistant message
-  replaces it on the next authoritative parse. Agentsview reversibly escapes
-  `%` and the reserved remote-host separator `~` in canonical session IDs.
-  Explicit raw-ID lookups remain literal; canonical escaping is decoded only
-  when lookup starts from a full session ID. Per-response usage events are the
-  sole analytics rows, while messages retain explicit context/output token
-  fields without duplicating the raw Harness usage blob into `token_usage`.
-  Plain and zstd artifacts in one session directory are treated as one logical
-  source and rejected while both exist; a change maps directly to the
-  surviving sibling once that conflict is removed. The optional Harness SQLite
-  persistence backend is not supported. The updated inventory accepts all
-  released version-0 event names, including `model/selection`, delivery
-  tracking, subagent model policy, and team events. These metadata events do
-  not add transcript rows; model-selection reasoning effort is not imported.
+  replaces it on the next authoritative parse. Generation-2 and later messages
+  read embedded stream usage and finish reasons when the outer data omits
+  them, and generation-3 system messages join the transcript as system rows.
+  Agentsview reversibly escapes `%` and the reserved remote-host separator `~`
+  in canonical session IDs. Explicit raw-ID lookups remain literal; canonical
+  escaping is decoded only when lookup starts from a full session ID.
+  Per-response usage events are the sole analytics rows, while messages retain
+  explicit context/output token fields without duplicating the raw Harness
+  usage blob into `token_usage`. Plain and zstd artifacts in one session
+  directory are treated as one logical source and rejected while both exist; a
+  change maps directly to the surviving sibling once that conflict is removed.
+  The version-0 inventory accepts all released event names, including
+  `model/selection`, delivery tracking, subagent model policy, and team
+  events; those metadata events do not add transcript rows. The version-0
+  provenance validator accepts mixed safe-integer and inclusive-range entries
+  without allocating an expanded list. Model-selection reasoning effort is not
+  imported. The optional Harness SQLite persistence backend is not supported.
 
-- **Later formats:** The reverified upstream
-  [session schema](https://github.com/deepseek-ai/deepseek-harness/blob/56c4c3e47c195ff5edbfe3d307bdef81f3de348b/packages/core/session/src/types.ts)
-  is version `3`. Agentsview still rejects versions `1` through `3` and does
-  not run upstream's migrations. The current
-  [generated event inventory](https://github.com/deepseek-ai/deepseek-harness/blob/56c4c3e47c195ff5edbfe3d307bdef81f3de348b/packages/core/session/src/known-event-types.ts)
-  includes later events such as `assistant/attempt`, `system/message`, and
-  `tool/ptc-dispatch*`; these do not belong to the frozen version-0 inventory.
-  Version-3 system messages and `startSeq`/`endSeq` surface replacements need
-  a separate format update. Accepting compressed provenance and version-0
-  metadata does not add support for later session formats.
+- **Later formats:** Agentsview reads the on-disk generations directly and does
+  not run upstream's v0-to-v3 migrations. Generation-1 rows keep the version-0
+  packed assistant chunks. Generation-2 rows carry the embedded assistant
+  stream and `assistant/attempt`; Agentsview imports final stream usage and
+  finish reasons but does not reconstruct an assistant message from a failed
+  attempt that produced none. Generation-2 request-header `system` prompts are
+  not imported as transcript rows. Generation-3 seeded sessions use the last
+  `session/end-seed {inherited:true}` marker as the inherited cut, and
+  replacement coordinates use `startSeq`/`endSeq`.
 
 ## OpenClaw (`openclaw`)
 
@@ -2203,6 +2386,12 @@ schemas keep their existing ordering behavior.
   [hermes_state.py](https://github.com/NousResearch/hermes-agent/blob/299e409f15aa5615a8a64be488580be92cda351e/hermes_state.py)
   and
   [usage_pricing.py](https://github.com/NousResearch/hermes-agent/blob/299e409f15aa5615a8a64be488580be92cda351e/agent/usage_pricing.py).
+- **Windows root check (2026-09-22).** The pinned
+  [Hermes constants](https://github.com/NousResearch/hermes-agent/blob/2182f51d7ce7073b61a91ffc110e1ccb68a877cc/hermes_constants.py)
+  select `%LOCALAPPDATA%/hermes`, fall back to `~/AppData/Local/hermes`, and
+  place `state.db` directly under that home. The
+  [session-storage guide](https://github.com/NousResearch/hermes-agent/blob/2182f51d7ce7073b61a91ffc110e1ccb68a877cc/website/docs/developer-guide/session-storage.md)
+  documents the same sibling database layout.
 - **Timestamp check (2026-09-10):** Reverified the pinned `hermes_state.py`:
   `end_session` writes `ended_at` from `time.time()` only when closing a
   session. `append_message` and `_insert_message_rows` persist message times
@@ -2288,6 +2477,11 @@ schemas keep their existing ordering behavior.
   match (see `EffortTierBaseModel` in `internal/pricing/normalize.go`). Truly
   opaque names (`adaptive`, `compactor`, `MODEL_PRIVATE_*`, Devin codenames
   such as `claude-5-fable-*`) have no catalog entry and remain unpriced.
+  `message_nodes.node_id` and transcript `step_id` are per-session sequences
+  (`UNIQUE(session_id, node_id)` in the Devin DDL), so message source
+  identities are prefixed with the session id to stay unique under
+  cross-session usage deduplication. Verified against a live Devin CLI
+  database 2026-09-17.
 - **Agentsview:** `internal/parser/devin.go` and
   `internal/parser/devin_provider.go`; metric aliases are implementation
   evidence because the upstream schema is unavailable.
@@ -2308,10 +2502,17 @@ schemas keep their existing ordering behavior.
   cache-write, model, and service-tier data. The official analyzer derives
   price from those fields; it does not read a persisted provider USD total.
   Agentsview likewise normalizes the counters and catalog-prices the result.
-- **Agentsview:** `internal/parser/piebald.go`. Reverified 2026-09-10 with
+- **Agentsview:** `internal/parser/piebald.go`. Reverified 2026-09-17 with
   isolated SQLite fixtures: hosted WAL snapshots use immutable reads in
-  read-only materializations; live reads retain uncheckpointed WAL rows.
-  Producer schema and usage semantics are unchanged.
+  read-only materializations; live reads retain uncheckpointed WAL rows. The
+  parser probes `chats` and uses an empty SQL literal when `current_directory`
+  is absent. Issue [#1819](https://github.com/kenn-io/agentsview/issues/1819)
+  reports an older schema, but no database was attached, so that
+  release-specific claim is unverified. The pinned analyzer reads the current
+  store and does not prove the historical schema. Reverified 2026-09-20: the
+  pinned analyzer joins `chats` to `projects` without selecting
+  `chats.current_directory`. Sync remembers schema failures until database or
+  WAL state changes.
 
 ## Warp (`warp`)
 
@@ -2666,13 +2867,20 @@ schemas keep their existing ordering behavior.
 ## WorkBuddy (`workbuddy`)
 
 - **Format:** Session JSONL with provider-specific raw usage embedded under
-  message provider data.
+  message provider data. Issue
+  [#1860](https://github.com/kenn-io/agentsview/issues/1860) reports
+  `ai-title` records with an `aiTitle` string. Agentsview selects the last
+  nonblank value after trimming whitespace. Synthetic parser tests cover the
+  reported shape and boundary values; they do not verify a producer.
 - **Evidence:** `no-public-source`.
 - **Upstream:** WorkBuddy's first-party product site, documentation, and public
   repositories were searched 2026-07-19; no authoritative persistence producer
-  or versioned schema was found. For reproducible independent format and
-  accounting evidence, clone `https://github.com/mm7894215/TokenTracker.git`
-  at `eaf6048b07729f3ae1224def6011ea22f80cd035` and inspect its pinned
+  or versioned schema was found. Issue
+  [#1860](https://github.com/kenn-io/agentsview/issues/1860) is reporter
+  evidence for the `ai-title` shape, without producer-version evidence. For
+  reproducible independent format and accounting evidence, clone
+  `https://github.com/mm7894215/TokenTracker.git` at
+  `eaf6048b07729f3ae1224def6011ea22f80cd035` and inspect its pinned
   [WorkBuddy reader](https://github.com/mm7894215/TokenTracker/blob/eaf6048b07729f3ae1224def6011ea22f80cd035/src/lib/rollout.js),
   which documents the recursive JSONL layout, raw usage variants, cache and
   reasoning normalization, model fallback, and newer `workbuddy.db` aggregate
@@ -2683,6 +2891,47 @@ schemas keep their existing ordering behavior.
   is catalog-derived.
 - **Agentsview:** `internal/parser/workbuddy.go` and
   `internal/parser/workbuddy_provider.go`; counter semantics are
+  implementation evidence.
+
+## CodeBuddy (`codebuddy`)
+
+- **Format:** Hierarchical session manifest (`index.json`) and individual
+  message files (`messages/*.json`). Workspace metadata lives in the parent
+  `index.json`. Message and `extra` envelopes accept JSON objects or encoded
+  JSON strings. Source text blocks are concatenated; working directories are
+  extracted independently from the user envelope. Explicit `thinking` and
+  `reasoning` content blocks are retained as thinking text.
+- **Evidence:** `no-public-source`.
+- **Upstream:** Tencent CodeBuddy's product site and public repositories were
+  searched 2026-09-17; no authoritative persistence producer or versioned
+  schema is publicly published. Storage format and accounting semantics were
+  verified against local Tencent CodeBuddy IDE and CodeBuddyExtension session
+  data under `CodeBuddyExtension/Data/history`.
+- **Usage and cost:** The parser interprets `lastStepInputTokens` as inclusive
+  input, subtracts `lastStepCachedInputTokens` for uncached input (floored at
+  zero), and preserves `lastStepOutputTokens` and
+  `statsSnapshot.thinkingTokens` separately. Missing, null, or negative
+  counters do not establish known usage; explicit zero does. Cache-only
+  records do not establish a complete context size. Monetary cost is
+  catalog-derived.
+- **Verification boundary:** Parser behavior was reverified on 2026-09-17 with
+  synthetic regression fixtures in `internal/parser/codebuddy_test.go`,
+  including thinking-only and usage-only messages, composite fingerprints,
+  workspace metadata changes, and deleted message events. Sync regression
+  fixtures in `internal/sync/codebuddy_integration_test.go` also verify that
+  equal-size rewrites with restored modification times invalidate both stored
+  freshness and warm skip caches through the composite content hash. Valid
+  manifests with no readable messages produce an empty session replacement,
+  clearing previously stored messages. Invalid JSON or a missing/non-array
+  `messages` field is a parse error and preserves the archive. Integration
+  fixtures cover empty manifests, deleted or invalid message files, and
+  invalid manifests after an initial import. These fixtures do not
+  independently establish producer counter semantics. The original local
+  artifact observation above has no pinned producer version; whether thinking
+  snapshots are cumulative and which releases include cached input in the input
+  counter remain unverified. Do not treat this as audited billing parity.
+- **Agentsview:** `internal/parser/codebuddy.go` and
+  `internal/parser/codebuddy_provider.go`; counter semantics are
   implementation evidence.
 
 ## Zencoder (`zencoder`)
@@ -2763,7 +3012,10 @@ schemas keep their existing ordering behavior.
   services, but Agentsview does not join that accounting store to session
   files; cache, reasoning totals, and USD cost are therefore absent.
 - **Agentsview:** `internal/parser/qwenpaw.go` and
-  `internal/parser/qwenpaw_provider.go`.
+  `internal/parser/qwenpaw_provider.go`. Reverified 2026-09-16 against the
+  parser: first-message previews keep at most 300 runes without a suffix. The
+  shared truncation helper preserves that display rule; the recorded format
+  and usage handling are unchanged.
 
 ## Shelley (`shelley`)
 
@@ -3045,6 +3297,10 @@ schemas keep their existing ordering behavior.
   contained `reasoning`, `totalTokens`, and cost objects, which AgentsView
   ignores. A producer-derived test covers 25 total cache-write tokens and a
   10-token one-hour subset.
+- **Usage encoding reverified (2026-09-16):** The pinned message model still
+  exposes input, output, cache-read, and cache-write usage. AgentsView keeps
+  its normalized JSON keys sorted so unchanged usage compares byte-for-byte
+  equal after reparsing.
 - **Agentsview:** `internal/parser/tau.go` and `internal/parser/tau_provider.go`
   read each transcript once, exclude the exact `index.jsonl` basename, use the
   filename for ordinary session identity, and encode the project directory

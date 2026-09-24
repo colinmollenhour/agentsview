@@ -11,6 +11,22 @@ describe("RecallCorpusPanel", () => {
   let component: ReturnType<typeof mount> | undefined;
   let fetchMock: ReturnType<typeof vi.fn>;
 
+  // Opens the refresh control's timeline and returns its row labels and
+  // total duration.
+  async function queryTimeline(): Promise<{ names: string[]; total: string }> {
+    document
+      .querySelector(".kit-tooltip-trigger")!
+      .dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    await tick();
+    const tooltip = document.querySelector('[role="tooltip"]')!;
+    return {
+      names: Array.from(tooltip.querySelectorAll(".query-steps__name")).map(
+        (name) => name.textContent ?? "",
+      ),
+      total: tooltip.querySelector(".query-steps__total")?.textContent ?? "",
+    };
+  }
+
   beforeEach(() => {
     setLocale("en");
     fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -328,6 +344,152 @@ describe("RecallCorpusPanel", () => {
     });
     expect(entryRequests).toBe(2);
     expect(statusRequests).toBe(2);
+    // A completed refresh reports both requests in the query timeline.
+    expect((await queryTimeline()).names).toEqual(["Entries", "Extraction status"]);
+  });
+
+  it("keeps the previous query timing when a refresh's status request fails", async () => {
+    // The clock stands still during the first load, so it measures 0 ms. It
+    // jumps by 500 ms while the refresh's entries request is in flight, so a
+    // timeline published from that request alone would read 500 ms.
+    let nowMs = 1_000;
+    vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+    const defaultFetch = fetchMock as unknown as (input: RequestInfo | URL) => Promise<Response>;
+    let entryRequests = 0;
+    let statusRequests = 0;
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/recall/entries?")) {
+        entryRequests++;
+        if (entryRequests > 1) nowMs += 500;
+      }
+      if (url.includes("/recall/extraction/status")) {
+        statusRequests++;
+        if (statusRequests > 1) {
+          return new Response("extraction status unavailable", { status: 500 });
+        }
+      }
+      return defaultFetch(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    component = mount(RecallCorpusPanel, { target: document.body });
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("Keep extraction passes bounded");
+    });
+    // The initial entries load reports itself on its own.
+    expect(await queryTimeline()).toEqual({ names: ["Entries"], total: "0 ms" });
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Refresh"]')!.click();
+    await vi.waitFor(() => {
+      expect(document.querySelector(".status-error")).not.toBeNull();
+    });
+    expect(entryRequests).toBe(2);
+    expect(statusRequests).toBe(2);
+    // The entries request succeeded, but the pair did not: the timeline still
+    // shows the earlier standalone load rather than a fresh partial result.
+    expect(await queryTimeline()).toEqual({ names: ["Entries"], total: "0 ms" });
+  });
+
+  it("does not publish a refresh whose entries request a filter change superseded", async () => {
+    const defaultFetch = fetchMock as unknown as (input: RequestInfo | URL) => Promise<Response>;
+    let entryRequests = 0;
+    let releaseRefreshEntries: (() => void) | undefined;
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/recall/entries?")) {
+        entryRequests++;
+        // Hold the refresh's entries request open until the test releases it.
+        if (entryRequests === 2) {
+          await new Promise<void>((resolve) => {
+            releaseRefreshEntries = resolve;
+          });
+        }
+      }
+      return defaultFetch(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    component = mount(RecallCorpusPanel, { target: document.body });
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("Keep extraction passes bounded");
+    });
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Refresh"]')!.click();
+    await vi.waitFor(() => {
+      expect(releaseRefreshEntries).toBeDefined();
+    });
+    // The search change starts its own entries load, which cancels the
+    // refresh's copy while the refresh's status request has already applied.
+    const search = document.querySelector<HTMLInputElement>(
+      'input[placeholder="Search Recall entries…"]',
+    )!;
+    search.value = "bounded";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain(
+        "Ranked search is limited to the first 500 matches.",
+      );
+    });
+    releaseRefreshEntries!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // The refresh must not pair the search's entries request with its own
+    // status request; the search load's standalone timeline stands.
+    expect(entryRequests).toBe(3);
+    expect(await queryTimeline()).toEqual(
+      expect.objectContaining({ names: ["Entries"] }),
+    );
+  });
+
+  it("does not let a slow refresh overwrite a newer filter load's timeline", async () => {
+    const defaultFetch = fetchMock as unknown as (input: RequestInfo | URL) => Promise<Response>;
+    let entryRequests = 0;
+    let statusRequests = 0;
+    let releaseRefreshStatus: (() => void) | undefined;
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/recall/entries?")) entryRequests++;
+      if (url.includes("/recall/extraction/status")) {
+        statusRequests++;
+        // Hold the refresh's status request open until the test releases it.
+        if (statusRequests === 2) {
+          await new Promise<void>((resolve) => {
+            releaseRefreshStatus = resolve;
+          });
+        }
+      }
+      return defaultFetch(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    component = mount(RecallCorpusPanel, { target: document.body });
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("Keep extraction passes bounded");
+    });
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Refresh"]')!.click();
+    // The refresh's entries request applies while its status request waits.
+    await vi.waitFor(() => {
+      expect(entryRequests).toBe(2);
+      expect(releaseRefreshStatus).toBeDefined();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const search = document.querySelector<HTMLInputElement>(
+      'input[placeholder="Search Recall entries…"]',
+    )!;
+    search.value = "bounded";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain(
+        "Ranked search is limited to the first 500 matches.",
+      );
+    });
+    expect((await queryTimeline()).names).toEqual(["Entries"]);
+    releaseRefreshStatus!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Both refresh requests applied, but the search load overtook the
+    // entries request, so the refresh must not replace the newer timeline.
+    expect(entryRequests).toBe(3);
+    expect((await queryTimeline()).names).toEqual(["Entries"]);
   });
 
   it("drills into actionable extraction progress and source sessions", async () => {

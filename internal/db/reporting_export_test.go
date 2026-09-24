@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"encoding/json/jsontext"
 	"fmt"
 	"math"
@@ -19,7 +18,7 @@ import (
 func TestReportingExportCompletedEmptyDayHas24QuietHours(t *testing.T) {
 	d := testDB(t)
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -56,7 +55,7 @@ func TestReportingExportSplitsActivityAndAssignsFirstSeenOnce(t *testing.T) {
 		t, d, "cross-hour", 2, "assistant", "2026-07-28T11:02:00Z", "opus",
 	)
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -86,7 +85,7 @@ func TestReportingExportSplitsActivityAndAssignsFirstSeenOnce(t *testing.T) {
 	assert.False(t, day.Hours[12].HasData)
 
 	existing, err := d.GetActivityReport(
-		context.Background(),
+		t.Context(),
 		AnalyticsFilter{Timezone: "UTC"},
 		dayQuery(t, "2026-07-28", "UTC"),
 	)
@@ -98,10 +97,54 @@ func TestReportingExportSplitsActivityAndAssignsFirstSeenOnce(t *testing.T) {
 	assert.InDelta(t, existing.Totals.AgentMinutes, hourlyAgentMinutes, 0.0001)
 }
 
+func TestReportingExportPreservesPriorModelsAcrossHourWindows(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "carry", "project-a", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-07-27T23:58:00Z")
+		s.EndedAt = Ptr("2026-07-28T00:02:00Z")
+	})
+	seedMessage(t, d, "carry", 1, "user", "2026-07-27T23:58:00Z", "")
+	seedMessage(t, d, "carry", 2, "assistant", "2026-07-27T23:59:00Z", "prior-model")
+	seedMessage(t, d, "carry", 3, "user", "2026-07-28T00:01:00Z", "")
+	seedMessage(t, d, "carry", 4, "assistant", "2026-07-28T00:02:00Z", "")
+
+	insertSession(t, d, "unordered", "project-a", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-07-28T10:58:00Z")
+		s.EndedAt = Ptr("2026-07-28T11:02:00Z")
+	})
+	seedMessage(t, d, "unordered", 1, "user", "2026-07-28T10:58:00Z", "")
+	seedMessage(t, d, "unordered", 2, "assistant", "2026-07-28T11:01:00Z", "model-a")
+	// This backwards timestamp must not replace the inherited model.
+	seedMessage(t, d, "unordered", 3, "assistant", "2026-07-28T10:59:00Z", "backwards-model")
+	seedMessage(t, d, "unordered", 4, "user", "2026-07-28T11:02:00Z", "")
+
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
+		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
+		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	require.Len(t, day.Hours, 24)
+	for _, tt := range []struct {
+		hour  int
+		model string
+	}{
+		{0, "prior-model"},
+		{10, "model-a"},
+		{11, "model-a"},
+	} {
+		hour := day.Hours[tt.hour]
+		assert.InDelta(t, 2, hour.Activity.Totals.AgentMinutes, 0.0001, "hour %d", tt.hour)
+		require.Len(t, hour.Activity.ByModel, 1, "hour %d", tt.hour)
+		assert.Equal(t, tt.model, hour.Activity.ByModel[0].Key, "hour %d", tt.hour)
+	}
+}
+
 func TestReportingExportCurrentDayOmitsOpenHour(t *testing.T) {
 	d := testDB(t)
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 14, 37, 0, 0, time.UTC),
 	})
@@ -151,17 +194,17 @@ func TestReportingExportSeparatesSubagentsAndIndependentPeaks(t *testing.T) {
 		}
 	}
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
 	require.Len(t, day.Hours, 24)
 	hour := day.Hours[10]
-	assert.Equal(t, 11.0, hour.Activity.Totals.AgentMinutes)
-	assert.Equal(t, 3.0, hour.Activity.Totals.InteractiveAgentMinutes)
-	assert.Equal(t, 5.0, hour.Activity.Totals.SubagentAgentMinutes)
-	assert.Equal(t, 3.0, hour.Activity.Totals.AutomatedAgentMinutes)
+	assert.InDelta(t, 11.0, hour.Activity.Totals.AgentMinutes, 0)
+	assert.InDelta(t, 3.0, hour.Activity.Totals.InteractiveAgentMinutes, 0)
+	assert.InDelta(t, 5.0, hour.Activity.Totals.SubagentAgentMinutes, 0)
+	assert.InDelta(t, 3.0, hour.Activity.Totals.AutomatedAgentMinutes, 0)
 	assert.Equal(t, money.Money{Microdollars: 70}, hour.Activity.Totals.Cost)
 	assert.Equal(t, money.Money{Microdollars: 20}, hour.Activity.Totals.InteractiveCost)
 	assert.Equal(t, money.Money{Microdollars: 30}, hour.Activity.Totals.SubagentCost)
@@ -189,15 +232,15 @@ func TestReportingExportSeparatesSubagentsAndIndependentPeaks(t *testing.T) {
 	assert.Zero(t, bucket.AutomatedAtPeak)
 	for _, rows := range [][]export.ReportingActivityBreakdown{hour.Activity.ByModel, hour.Activity.ByAgent} {
 		require.Len(t, rows, 1)
-		assert.Equal(t, 11.0, rows[0].AgentMinutes)
-		assert.Equal(t, 3.0, rows[0].InteractiveAgentMinutes)
-		assert.Equal(t, 5.0, rows[0].SubagentAgentMinutes)
-		assert.Equal(t, 3.0, rows[0].AutomatedAgentMinutes)
+		assert.InDelta(t, 11.0, rows[0].AgentMinutes, 0)
+		assert.InDelta(t, 3.0, rows[0].InteractiveAgentMinutes, 0)
+		assert.InDelta(t, 5.0, rows[0].SubagentAgentMinutes, 0)
+		assert.InDelta(t, 3.0, rows[0].AutomatedAgentMinutes, 0)
 		assert.Equal(t, money.Money{Microdollars: 30}, rows[0].SubagentCost)
 	}
 	require.Len(t, hour.Activity.ByProject, 1)
-	assert.Equal(t, 11.0, hour.Activity.ByProject[0].AgentMinutes)
-	assert.Equal(t, 5.0, hour.Activity.ByProject[0].SubagentAgentMinutes)
+	assert.InDelta(t, 11.0, hour.Activity.ByProject[0].AgentMinutes, 0)
+	assert.InDelta(t, 5.0, hour.Activity.ByProject[0].SubagentAgentMinutes, 0)
 	assert.Equal(t, money.Money{Microdollars: 30}, hour.Activity.ByProject[0].SubagentCost)
 }
 
@@ -228,7 +271,7 @@ func TestReportingExportAllocatesAuthoritativeSessionCostBeforeHourPartition(
 		s.EndedAt = Ptr("2026-07-28T11:10:00Z")
 	})
 	reportedCost := money.MustParseDollars("0.03")
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"copilot:hourly-authoritative",
 		[]UsageEvent{
 			{
@@ -251,7 +294,7 @@ func TestReportingExportAllocatesAuthoritativeSessionCostBeforeHourPartition(
 		},
 	))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -268,7 +311,7 @@ func TestReportingExportAllocatesAuthoritativeSessionCostBeforeHourPartition(
 	assert.Equal(t, 1, hour10.Activity.Totals.NewModels)
 	assert.Equal(t, 1, hour11.Activity.Totals.NewModels)
 
-	existing, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	existing, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From: "2026-07-28", To: "2026-07-28", Timezone: "UTC",
 	})
 	require.NoError(t, err)
@@ -313,7 +356,7 @@ func TestReportingExportAllocatesAuthoritativeCostByDailyBreakdownKey(
 		s.EndedAt = Ptr("2026-07-28T10:03:00Z")
 	})
 	reportedCost := money.Money{Microdollars: 1}
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"fixture-authoritative-key",
 		[]UsageEvent{
 			{
@@ -336,12 +379,12 @@ func TestReportingExportAllocatesAuthoritativeCostByDailyBreakdownKey(
 		},
 	))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From:       "2026-07-28",
 		To:         "2026-07-28",
 		Timezone:   "UTC",
@@ -373,7 +416,7 @@ func TestReportingExportPreservesZeroWeightAuthoritativeBreakdownKeys(
 		s.EndedAt = Ptr("2026-07-28T10:03:00Z")
 	})
 	reportedCost := money.Money{Microdollars: 1}
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"fixture-authoritative-zero",
 		[]UsageEvent{
 			{
@@ -394,12 +437,12 @@ func TestReportingExportPreservesZeroWeightAuthoritativeBreakdownKeys(
 		},
 	))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From:       "2026-07-28",
 		To:         "2026-07-28",
 		Timezone:   "UTC",
@@ -423,7 +466,7 @@ func TestReportingExportPreservesZeroWeightAuthoritativeBreakdownKeys(
 
 func TestReportingExportClampsStandaloneUsageTokens(t *testing.T) {
 	d := testDB(t)
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{
+	require.NoError(t, d.InsertCursorUsageEvents(t.Context(), []CursorUsageEvent{
 		{
 			OccurredAt:       "2026-07-28T09:05:00Z",
 			Model:            "model-negative",
@@ -446,12 +489,12 @@ func TestReportingExportClampsStandaloneUsageTokens(t *testing.T) {
 		},
 	}))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From:       "2026-07-28",
 		To:         "2026-07-28",
 		Timezone:   "UTC",
@@ -462,20 +505,18 @@ func TestReportingExportClampsStandaloneUsageTokens(t *testing.T) {
 	hour := day.Hours[9]
 	assert.Equal(t, int64(MaxPlausibleTokens), hour.Usage.Totals.InputTokens)
 	assert.Equal(t, int64(MaxPlausibleTokens), hour.Usage.Totals.OutputTokens)
-	assert.Equal(
-		t, int64(MaxPlausibleTokens),
+	assert.Equal(t,
+		int64(MaxPlausibleTokens),
 		hour.Usage.Totals.CacheCreationTokens,
 	)
 	assert.Equal(t, int64(MaxPlausibleTokens), hour.Usage.Totals.CacheReadTokens)
 	assert.Equal(t, daily.Totals.InputTokens, int(hour.Usage.Totals.InputTokens))
 	assert.Equal(t, daily.Totals.OutputTokens, int(hour.Usage.Totals.OutputTokens))
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		daily.Totals.CacheCreationTokens,
 		int(hour.Usage.Totals.CacheCreationTokens),
 	)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		daily.Totals.CacheReadTokens,
 		int(hour.Usage.Totals.CacheReadTokens),
 	)
@@ -490,8 +531,7 @@ func TestReportingExportClampsStandaloneUsageTokens(t *testing.T) {
 		case "model-oversized":
 			assert.Equal(t, int64(MaxPlausibleTokens), breakdown.InputTokens)
 			assert.Equal(t, int64(MaxPlausibleTokens), breakdown.OutputTokens)
-			assert.Equal(
-				t,
+			assert.Equal(t,
 				int64(MaxPlausibleTokens),
 				breakdown.CacheCreationTokens,
 			)
@@ -524,12 +564,12 @@ func TestReportingExportUsesOneCoherentReadSnapshot(t *testing.T) {
 		)
 	}
 
-	first, err := d.ExportReportingDay(context.Background(), opts)
+	first, err := d.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)
 	assert.False(t, first.HasData)
 
 	opts.afterSnapshot = nil
-	second, err := d.ExportReportingDay(context.Background(), opts)
+	second, err := d.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)
 	assert.True(t, second.HasData)
 	assert.Equal(t, 1, second.Hours[10].Activity.Totals.NewSessions)
@@ -550,7 +590,7 @@ func TestReportingExportIncludesStandaloneRowsOnlyInUsage(t *testing.T) {
 		"session-model",
 	)
 	sessionCost := money.MustParseDollars("0.007")
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"session-linked",
 		[]UsageEvent{{
 			Source:       "session-source",
@@ -570,7 +610,7 @@ func TestReportingExportIncludesStandaloneRowsOnlyInUsage(t *testing.T) {
 		s.EndedAt = Ptr("2026-07-27T08:01:00Z")
 	})
 	usageOnlyCost := money.MustParseDollars("0.003")
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"fixture-usage-only",
 		[]UsageEvent{{
 			Source:       "fixture-source",
@@ -584,7 +624,7 @@ func TestReportingExportIncludesStandaloneRowsOnlyInUsage(t *testing.T) {
 			DedupKey:     "fixture-usage-only",
 		}},
 	))
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{
+	require.NoError(t, d.InsertCursorUsageEvents(t.Context(), []CursorUsageEvent{
 		{
 			OccurredAt:       "2026-07-28T09:05:00Z",
 			Model:            "standalone-model-a",
@@ -610,7 +650,7 @@ func TestReportingExportIncludesStandaloneRowsOnlyInUsage(t *testing.T) {
 		},
 	}))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -623,13 +663,11 @@ func TestReportingExportIncludesStandaloneRowsOnlyInUsage(t *testing.T) {
 	assert.Equal(t, int64(3), hour9.Usage.Totals.CacheCreationTokens)
 	assert.Equal(t, int64(5), hour9.Usage.Totals.CacheReadTokens)
 	assert.Equal(t, money.MustParseDollars("0.004"), hour9.Usage.Totals.Cost)
-	assert.ElementsMatch(
-		t,
+	assert.ElementsMatch(t,
 		[]string{"standalone-model-a", "model usage-only"},
 		reportingUsageBreakdownKeys(hour9.Usage.ByModel),
 	)
-	assert.ElementsMatch(
-		t,
+	assert.ElementsMatch(t,
 		[]string{"cursor", "agent usage-only"},
 		reportingUsageBreakdownKeys(hour9.Usage.ByAgent),
 	)
@@ -655,7 +693,7 @@ func TestReportingExportIncludesStandaloneRowsOnlyInUsage(t *testing.T) {
 	assert.Zero(t, hour10.Activity.Totals.AgentMinutes)
 	assert.Zero(t, hour10.Activity.Totals.NewModels)
 
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From:       "2026-07-28",
 		To:         "2026-07-28",
 		Timezone:   "UTC",
@@ -675,8 +713,8 @@ func TestReportingExportIncludesStandaloneRowsOnlyInUsage(t *testing.T) {
 	}
 	assert.Equal(t, int64(daily.Totals.InputTokens), exportedInput)
 	assert.Equal(t, int64(daily.Totals.OutputTokens), exportedOutput)
-	assert.Equal(
-		t, int64(daily.Totals.CacheCreationTokens), exportedCacheCreation,
+	assert.Equal(t,
+		int64(daily.Totals.CacheCreationTokens), exportedCacheCreation,
 	)
 	assert.Equal(t, int64(daily.Totals.CacheReadTokens), exportedCacheRead)
 	assert.Equal(t, daily.Totals.TotalCost, exportedCost)
@@ -717,7 +755,7 @@ func TestReportingExportUsesAttributedSessionMetadataForCompleteSnapshot(
 		},
 	)
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -739,7 +777,7 @@ func TestReportingExportDeduplicatesMergedUsageInputs(t *testing.T) {
 		s.EndedAt = Ptr("2026-07-28T09:01:00Z")
 	})
 	sessionCost := money.MustParseDollars("0.002")
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"fixture-dedup",
 		[]UsageEvent{{
 			Source:       "merged-source",
@@ -753,7 +791,7 @@ func TestReportingExportDeduplicatesMergedUsageInputs(t *testing.T) {
 			DedupKey:     "shared",
 		}},
 	))
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{{
+	require.NoError(t, d.InsertCursorUsageEvents(t.Context(), []CursorUsageEvent{{
 		OccurredAt:   "2026-07-28T09:05:00Z",
 		Model:        "model standalone winner",
 		Kind:         "usage",
@@ -763,7 +801,7 @@ func TestReportingExportDeduplicatesMergedUsageInputs(t *testing.T) {
 		DedupKey:     "fixture-dedup:merged-source:shared",
 	}}))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -777,7 +815,7 @@ func TestReportingExportDeduplicatesMergedUsageInputs(t *testing.T) {
 	assert.Equal(t, "model standalone winner", hour.Usage.ByModel[0].Key)
 	assert.Empty(t, hour.Usage.ByProject)
 
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From:       "2026-07-28",
 		To:         "2026-07-28",
 		Timezone:   "UTC",
@@ -803,7 +841,7 @@ func TestReportingExportDedupMatchesDailyUsageForMixedTimestampPrecision(
 		s.EndedAt = Ptr("2026-07-28T09:01:00Z")
 	})
 	sessionCost := money.MustParseDollars("0.002")
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"fixture-mixed-precision",
 		[]UsageEvent{{
 			Source:       "fixture-source",
@@ -817,7 +855,7 @@ func TestReportingExportDedupMatchesDailyUsageForMixedTimestampPrecision(
 			DedupKey:     "shared",
 		}},
 	))
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{{
+	require.NoError(t, d.InsertCursorUsageEvents(t.Context(), []CursorUsageEvent{{
 		OccurredAt:   "2026-07-28T09:00:00.123Z",
 		Model:        "model text-order winner",
 		Kind:         "usage",
@@ -827,12 +865,12 @@ func TestReportingExportDedupMatchesDailyUsageForMixedTimestampPrecision(
 		DedupKey:     "fixture-mixed-precision:fixture-source:shared",
 	}}))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
 	require.NoError(t, err)
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From:       "2026-07-28",
 		To:         "2026-07-28",
 		Timezone:   "UTC",
@@ -858,7 +896,7 @@ func TestReportingExportPreservesMessageOrdinalForDedup(t *testing.T) {
 		s.StartedAt = Ptr("2026-07-28T09:00:00Z")
 		s.EndedAt = Ptr("2026-07-28T09:06:00Z")
 	})
-	require.NoError(t, d.InsertMessages([]Message{
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{
 		{
 			SessionID: "fixture-ordinal",
 			Ordinal:   0,
@@ -894,7 +932,7 @@ func TestReportingExportPreservesMessageOrdinalForDedup(t *testing.T) {
 		},
 	}))
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})
@@ -906,7 +944,7 @@ func TestReportingExportPreservesMessageOrdinalForDedup(t *testing.T) {
 	require.Len(t, hour.Usage.ByModel, 1)
 	assert.Equal(t, "model-z-ordinal-winner", hour.Usage.ByModel[0].Key)
 
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From: "2026-07-28", To: "2026-07-28", Timezone: "UTC",
 	})
 	require.NoError(t, err)
@@ -1178,9 +1216,9 @@ func TestReportingExportIsIndependentOfArchiveLayout(t *testing.T) {
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	}
 
-	firstDay, err := first.ExportReportingDay(context.Background(), opts)
+	firstDay, err := first.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)
-	secondDay, err := second.ExportReportingDay(context.Background(), opts)
+	secondDay, err := second.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)
 	_, firstBytes, err := export.FinalizeReportingDay(firstDay)
 	require.NoError(t, err)
@@ -1196,14 +1234,13 @@ func TestReportingExportIsIndependentOfArchiveLayout(t *testing.T) {
 		ids[i] = fmt.Sprintf("session-%03d", maxSQLVars-i)
 	}
 	events, err := first.activityReportActivityFrom(
-		context.Background(), first.getReader(), ids,
+		t.Context(), first.getReader(), ids,
 	)
 	require.NoError(t, err)
 	require.Len(t, events, 2*(maxSQLVars+1))
 	assert.Equal(t, "session-000", events[0].SessionID)
 	assert.Equal(t, 1, events[0].Ordinal)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		fmt.Sprintf("session-%03d", maxSQLVars),
 		events[len(events)-1].SessionID,
 	)
@@ -1248,7 +1285,7 @@ func seedReportingLayoutArchive(t *testing.T, d *DB, reverse bool) {
 			},
 		)
 	}
-	require.NoError(t, d.InsertMessages(messages))
+	require.NoError(t, d.InsertMessages(t.Context(), messages))
 
 	firstCost := money.MustParseDollars("0.001")
 	secondCost := money.MustParseDollars("0.009")
@@ -1277,7 +1314,7 @@ func seedReportingLayoutArchive(t *testing.T, d *DB, reverse bool) {
 	if reverse {
 		usage[0], usage[1] = usage[1], usage[0]
 	}
-	require.NoError(t, d.ReplaceSessionUsageEvents("session-000", usage))
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(), "session-000", usage))
 }
 
 func TestReportingHourDerivesAgentMinutes(t *testing.T) {
@@ -1314,27 +1351,24 @@ func TestReportingHourDerivesAgentMinutes(t *testing.T) {
 		export.ReportingSchemaVersion,
 	)
 	require.NoError(t, err)
-	assert.Equal(t, 0.5, hour.Activity.Totals.AgentMinutes)
+	assert.InDelta(t, 0.5, hour.Activity.Totals.AgentMinutes, 0)
 	require.Len(t, hour.Activity.ByModel, 1)
-	assert.Equal(
-		t,
+	assert.InDelta(t,
 		hour.Activity.ByModel[0].AutomatedAgentMinutes+
 			hour.Activity.ByModel[0].InteractiveAgentMinutes,
-		hour.Activity.ByModel[0].AgentMinutes,
+		hour.Activity.ByModel[0].AgentMinutes, 0,
 	)
 	require.Len(t, hour.Activity.ByAgent, 1)
-	assert.Equal(
-		t,
+	assert.InDelta(t,
 		hour.Activity.ByAgent[0].AutomatedAgentMinutes+
 			hour.Activity.ByAgent[0].InteractiveAgentMinutes,
-		hour.Activity.ByAgent[0].AgentMinutes,
+		hour.Activity.ByAgent[0].AgentMinutes, 0,
 	)
 	require.Len(t, hour.Activity.ByProject, 1)
-	assert.Equal(
-		t,
+	assert.InDelta(t,
 		hour.Activity.ByProject[0].AutomatedAgentMinutes+
 			hour.Activity.ByProject[0].InteractiveAgentMinutes,
-		hour.Activity.ByProject[0].AgentMinutes,
+		hour.Activity.ByProject[0].AgentMinutes, 0,
 	)
 }
 
@@ -1435,7 +1469,7 @@ func TestReportingHourRejectsInvalidAgentMinutes(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			assert.InDelta(t, tt.want, got, 0)
 		})
 	}
 }
@@ -1455,7 +1489,7 @@ func TestReportingFirstSeenUsesEffectiveIntervals(t *testing.T) {
 		"model-a",
 	)
 
-	day, err := d.ExportReportingDay(context.Background(), ReportingExportOptions{
+	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
 		Now:  time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	})

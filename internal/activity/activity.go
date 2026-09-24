@@ -616,8 +616,7 @@ func sessionUsageDedupTokenForRow(u UsageRow) (usageDedupToken, bool) {
 func ClaudeSnapshotSurvivorSelection(
 	usage []UsageRow,
 ) (mask []bool, attribution []string, webSearchRequests []int) {
-	mask, attribution, webSearchRequests, err :=
-		ClaudeSnapshotSurvivorSelectionContext(context.Background(), usage)
+	mask, attribution, webSearchRequests, err := ClaudeSnapshotSurvivorSelectionContext(context.Background(), usage)
 	if err != nil {
 		panic(err)
 	}
@@ -629,16 +628,14 @@ func ClaudeSnapshotSurvivorSelection(
 func ClaudeSnapshotSurvivorSelectionContext(
 	ctx context.Context, usage []UsageRow,
 ) (mask []bool, attribution []string, webSearchRequests []int, err error) {
-	mask, attribution, webSearchRequests, _, err =
-		claudeSnapshotSelectionContext(ctx, usage, nil)
+	mask, attribution, webSearchRequests, _, err = claudeSnapshotSelectionContext(ctx, usage, nil)
 	return mask, attribution, webSearchRequests, err
 }
 
 func claudeSnapshotSurvivorSelection(
 	usage []UsageRow, eligible []bool,
 ) (mask []bool, attribution []string, webSearchRequests []int) {
-	mask, attribution, webSearchRequests, _, err :=
-		claudeSnapshotSelectionContext(context.Background(), usage, eligible)
+	mask, attribution, webSearchRequests, _, err := claudeSnapshotSelectionContext(context.Background(), usage, eligible)
 	if err != nil {
 		panic(err)
 	}
@@ -664,9 +661,10 @@ func claudeSnapshotSelectionContext(
 	for i := range canonical {
 		canonical[i] = -1
 	}
-	best := make(map[claudeUsageSnapshotToken]int)
-	earliest := make(map[claudeUsageSnapshotToken]int)
-	maximumWebSearchRequests := make(map[claudeUsageSnapshotToken]int)
+	type snapshotSelection struct {
+		best, earliest, maximumWebSearchRequests int
+	}
+	selection := make(map[claudeUsageSnapshotToken]snapshotSelection)
 	for i, u := range usage {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, nil, err
@@ -685,24 +683,25 @@ func claudeSnapshotSelectionContext(
 			messageID: u.ClaudeMessageID,
 			requestID: u.ClaudeRequestID,
 		}
-		previous, ok := best[key]
-		if first, exists := earliest[key]; !exists ||
-			earlierClaudeSnapshotAttribution(u, usage[first]) {
-			earliest[key] = i
+		selected, ok := selection[key]
+		if !ok || earlierClaudeSnapshotAttribution(u, usage[selected.earliest]) {
+			selected.earliest = i
 		}
-		if !ok || laterClaudeSnapshot(u, usage[previous]) {
-			best[key] = i
+		if !ok || laterClaudeSnapshot(u, usage[selected.best]) {
+			selected.best = i
 		}
-		maximumWebSearchRequests[key] = max(
-			maximumWebSearchRequests[key], u.WebSearchRequests)
+		selected.maximumWebSearchRequests = max(
+			selected.maximumWebSearchRequests, u.WebSearchRequests)
+		selection[key] = selected
 	}
-	for key, i := range best {
+	for _, selected := range selection {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, nil, err
 		}
+		i := selected.best
 		mask[i] = true
-		attribution[i] = usage[earliest[key]].SessionID
-		webSearchRequests[i] = maximumWebSearchRequests[key]
+		attribution[i] = usage[selected.earliest].SessionID
+		webSearchRequests[i] = selected.maximumWebSearchRequests
 	}
 	for i, u := range usage {
 		if err := ctx.Err(); err != nil {
@@ -714,10 +713,10 @@ func claudeSnapshotSelectionContext(
 		if u.ClaudeMessageID == "" || u.ClaudeRequestID == "" {
 			continue
 		}
-		canonical[i] = best[claudeUsageSnapshotToken{
+		canonical[i] = selection[claudeUsageSnapshotToken{
 			messageID: u.ClaudeMessageID,
 			requestID: u.ClaudeRequestID,
-		}]
+		}].best
 	}
 	return mask, attribution, webSearchRequests, canonical, nil
 }
@@ -727,8 +726,7 @@ func claudeSnapshotSelectionContext(
 func CanonicalSessionTokenCoverageContext(
 	ctx context.Context, usage []UsageRow,
 ) (map[string]SessionTokenCoverage, error) {
-	_, _, _, snapshotCanonical, err :=
-		claudeSnapshotSelectionContext(ctx, usage, nil)
+	_, _, _, snapshotCanonical, err := claudeSnapshotSelectionContext(ctx, usage, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -858,8 +856,7 @@ func usageSurvivorSelection(
 		}
 		eligible[i] = true
 	}
-	snapshots, snapshotAttribution, snapshotWebSearchRequests :=
-		claudeSnapshotSurvivorSelection(usage, eligible)
+	snapshots, snapshotAttribution, snapshotWebSearchRequests := claudeSnapshotSurvivorSelection(usage, eligible)
 	mask = make([]bool, len(usage))
 	attribution = make([]string, len(usage))
 	webSearchRequests = make([]int, len(usage))
@@ -896,8 +893,7 @@ func usageSurvivorSelection(
 // effEnd == end, so nothing extra is excluded.
 func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
 	out := make([]UsageRow, 0, len(usage))
-	mask, attribution, webSearchRequests :=
-		usageSurvivorSelection(start, end, effEnd, usage, nil)
+	mask, attribution, webSearchRequests := usageSurvivorSelection(start, end, effEnd, usage, nil)
 	for i, keep := range mask {
 		if keep {
 			row := usage[i]
@@ -913,7 +909,8 @@ func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
 // into r.Totals and the window whose [Start, End) contains each row's
 // timestamp.
 func applyUsage(r *Report, p Params, windows []BucketWindow, start, end time.Time,
-	usage []UsageRow, kindBy map[string]sessionKind) error {
+	usage []UsageRow, kindBy map[string]sessionKind,
+) error {
 	survivors := dedupUsage(start, end, p.EffectiveEnd, usage)
 	return applyUsageRows(r, windows, survivors, AllocateUsageCosts(survivors),
 		kindBy)

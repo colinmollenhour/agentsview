@@ -3,13 +3,13 @@
 package duckdb
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // seedDuckWindowMessages seeds a session with 12 messages (ordinals 0..11)
@@ -28,7 +28,7 @@ func seedDuckWindowMessages(t *testing.T, local *db.DB, sessionID string) {
 		MessageCount: 1,
 		CreatedAt:    "2026-01-01T00:00:00Z",
 	}
-	require.NoError(t, local.UpsertSession(s), "seedDuckWindowMessages upsertSession %s", sessionID)
+	require.NoError(t, local.UpsertSession(t.Context(), s), "seedDuckWindowMessages upsertSession %s", sessionID)
 	roles := []string{
 		"user", "assistant", "user", "assistant", "system", "user",
 		"assistant", "user", "assistant", "system", "user", "assistant",
@@ -45,7 +45,7 @@ func seedDuckWindowMessages(t *testing.T, local *db.DB, sessionID string) {
 			IsSystem:      role == "system",
 		})
 	}
-	require.NoError(t, local.InsertMessages(msgs),
+	require.NoError(t, local.InsertMessages(t.Context(), msgs),
 		"seedDuckWindowMessages insertMessages %s", sessionID)
 }
 
@@ -53,10 +53,10 @@ func seedDuckWindowMessages(t *testing.T, local *db.DB, sessionID string) {
 // DuckDB mirror, and returns the read-only Store.
 func newDuckWindowStore(t *testing.T, setup func(local *db.DB)) *Store {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	local := newLocalDB(t)
 	setup(local)
-	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
 	require.NoError(t, createSchema(ctx, syncer.DB()))
 	_, err := syncer.pushEverything(ctx, nil)
 	require.NoError(t, err, "Push to DuckDB mirror")
@@ -72,7 +72,7 @@ func duckOrdinalsOf(msgs []db.Message) []int {
 }
 
 func TestDuckGetMessagesWindow_AroundMidSession(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newDuckWindowStore(t, func(local *db.DB) {
 		seedDuckWindowMessages(t, local, "sMid")
 	})
@@ -87,7 +87,7 @@ func TestDuckGetMessagesWindow_AroundMidSession(t *testing.T) {
 }
 
 func TestDuckGetMessagesWindow_RoleFilterCountsFilteredMessages(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newDuckWindowStore(t, func(local *db.DB) {
 		seedDuckWindowMessages(t, local, "sRoleCount")
 	})
@@ -103,7 +103,7 @@ func TestDuckGetMessagesWindow_RoleFilterCountsFilteredMessages(t *testing.T) {
 }
 
 func TestDuckGetMessagesWindow_AnchorIncludedEvenWhenRoleFiltered(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newDuckWindowStore(t, func(local *db.DB) {
 		seedDuckWindowMessages(t, local, "sAnchorFiltered")
 	})
@@ -120,7 +120,7 @@ func TestDuckGetMessagesWindow_AnchorIncludedEvenWhenRoleFiltered(t *testing.T) 
 }
 
 func TestDuckGetMessagesWindow_AroundOrdinalZeroHasNoBefore(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newDuckWindowStore(t, func(local *db.DB) {
 		seedDuckWindowMessages(t, local, "sFirst")
 	})
@@ -135,7 +135,7 @@ func TestDuckGetMessagesWindow_AroundOrdinalZeroHasNoBefore(t *testing.T) {
 }
 
 func TestDuckGetMessagesWindow_AroundLastOrdinalHasNoAfter(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newDuckWindowStore(t, func(local *db.DB) {
 		seedDuckWindowMessages(t, local, "sLast")
 	})
@@ -150,7 +150,7 @@ func TestDuckGetMessagesWindow_AroundLastOrdinalHasNoAfter(t *testing.T) {
 }
 
 func TestDuckGetMessagesWindow_LinearModeWithRoles(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newDuckWindowStore(t, func(local *db.DB) {
 		seedDuckWindowMessages(t, local, "sLinearRoles")
 	})
@@ -164,7 +164,7 @@ func TestDuckGetMessagesWindow_LinearModeWithRoles(t *testing.T) {
 }
 
 func TestDuckGetMessagesWindow_EmptyRolesEquivalentToGetMessages(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	store := newDuckWindowStore(t, func(local *db.DB) {
 		seedDuckWindowMessages(t, local, "sEquiv")
 	})
@@ -179,4 +179,48 @@ func TestDuckGetMessagesWindow_EmptyRolesEquivalentToGetMessages(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, direct, windowed,
 		"empty Roles should behave identically to GetMessages")
+}
+
+func TestDuckGetMessagesWindow_ReportsRevisionWithRows(t *testing.T) {
+	ctx := t.Context()
+	store := newDuckWindowStore(t, func(local *db.DB) {
+		seedDuckWindowMessages(t, local, "sRev")
+	})
+	sess, err := store.GetSession(ctx, "sRev")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TranscriptRevision)
+	require.NotEmpty(t, *sess.TranscriptRevision)
+
+	from := 4
+	revision := ""
+	msgs, err := store.GetMessagesWindow(ctx, "sRev", db.MessageWindow{
+		From: &from, Limit: 3, Asc: true,
+		Roles:            []string{"user", "assistant"},
+		ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{5, 6, 7}, duckOrdinalsOf(msgs))
+	assert.Equal(t, *sess.TranscriptRevision, revision,
+		"linear page must report the session revision it was read at")
+
+	anchor := 6
+	revision = ""
+	msgs, err = store.GetMessagesWindow(ctx, "sRev", db.MessageWindow{
+		Around: &anchor, Before: 2, After: 2,
+		Roles:            []string{"user", "assistant"},
+		ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{3, 5, 6, 7, 8}, duckOrdinalsOf(msgs))
+	assert.Equal(t, *sess.TranscriptRevision, revision,
+		"around window must report the session revision it was read at")
+
+	revision = ""
+	msgs, err = store.GetMessagesWindow(ctx, "missing", db.MessageWindow{
+		Around: &anchor, Before: 2, After: 2, ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, msgs)
+	assert.Empty(t, revision, "no rows means no revision to describe them")
 }

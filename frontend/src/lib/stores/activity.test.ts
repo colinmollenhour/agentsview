@@ -10,10 +10,6 @@ const api = vi.hoisted(() => ({
   getMachines: vi.fn(),
 }));
 
-const apiRuntimeMocks = vi.hoisted(() => ({
-  callGenerated: vi.fn((request: () => Promise<unknown>, _signal?: AbortSignal) => request()),
-}));
-
 const eventBus = vi.hoisted(() => ({
   subscribe: vi.fn(),
 }));
@@ -30,7 +26,6 @@ vi.mock("../api/activity-report.js", () => ({
   fetchActivitySessions: api.getActivitySessions,
 }));
 vi.mock("../api/runtime.js", () => ({
-  callGenerated: apiRuntimeMocks.callGenerated,
   isAbortError: vi.fn(() => false),
 }));
 vi.mock("./sync.svelte.js", () => ({ sync: { onSyncComplete: vi.fn() } }));
@@ -96,10 +91,7 @@ beforeEach(() => {
   api.getProjects.mockReset();
   api.getAgents.mockReset();
   api.getMachines.mockReset();
-  apiRuntimeMocks.callGenerated.mockReset();
-  apiRuntimeMocks.callGenerated.mockImplementation(
-    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
-  );
+
   api.getProjects.mockResolvedValue({ projects: [] });
   api.getAgents.mockResolvedValue({ agents: [] });
   api.getMachines.mockResolvedValue({ machines: [] });
@@ -108,6 +100,8 @@ beforeEach(() => {
   activity.loading = false;
   activity.error = null;
   activity.lastUpdatedAt = null;
+  activity.lastQueryDurationMs = null;
+  activity.lastQuerySteps = [];
   activity.hasNewData = false;
   activity.projects = [];
   activity.agents = [];
@@ -612,6 +606,104 @@ describe("freshness state", () => {
     }
   });
 
+  it("records how long the report query took, from request to data applied", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      expect(activity.lastQueryDurationMs).toBeNull();
+      api.getActivityReport.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(250);
+        return makeReport();
+      });
+      await activity.load();
+      expect(activity.lastQueryDurationMs).toBe(250);
+
+      api.getActivityReport.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(1800);
+        return makeReport();
+      });
+      await activity.load({ background: true });
+      expect(activity.lastQueryDurationMs).toBe(1800);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("splits the report query into its streamed phases", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      api.getActivityReport.mockImplementationOnce(async (_query, _signal, onProgress) => {
+        vi.advanceTimersByTime(100);
+        onProgress?.({ phase: "loading_sessions" });
+        vi.advanceTimersByTime(50);
+        onProgress?.({ phase: "loading_usage" });
+        vi.advanceTimersByTime(300);
+        onProgress?.({ phase: "scanning_activity", rows_processed: 10 });
+        vi.advanceTimersByTime(20);
+        onProgress?.({ phase: "finalizing" });
+        vi.advanceTimersByTime(30);
+        onProgress?.({ phase: "done" });
+        return makeReport();
+      });
+      await activity.load();
+
+      // Request latency before the first event belongs to the first phase.
+      expect(activity.lastQuerySteps).toEqual([
+        { name: "sessions", startMs: 0, durationMs: 150 },
+        { name: "usage", startMs: 150, durationMs: 300 },
+        { name: "scan", startMs: 450, durationMs: 20 },
+        { name: "finalize", startMs: 470, durationMs: 30 },
+      ]);
+      expect(activity.lastQueryDurationMs).toBe(500);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows each streamed phase live while the report query runs", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      const startedAt = performance.now();
+      let midway: unknown;
+      api.getActivityReport.mockImplementationOnce(async (_query, _signal, onProgress) => {
+        vi.advanceTimersByTime(100);
+        onProgress?.({ phase: "loading_sessions" });
+        vi.advanceTimersByTime(50);
+        onProgress?.({ phase: "loading_usage" });
+        midway = { startedAt: activity.liveQuery.startedAt, steps: activity.liveQuery.steps };
+        vi.advanceTimersByTime(300);
+        return makeReport();
+      });
+      await activity.load();
+
+      // The finished phase has its measured time; the phase in progress
+      // is marked running from its start.
+      expect(midway).toEqual({
+        startedAt,
+        steps: [
+          { name: "sessions", startMs: 0, durationMs: 150 },
+          { name: "usage", startMs: 150, durationMs: 0, running: true },
+        ],
+      });
+      expect(activity.liveQuery.startedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records a single report step when the response is not streamed", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      api.getActivityReport.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(80);
+        return makeReport();
+      });
+      await activity.load();
+      expect(activity.lastQuerySteps).toEqual([{ name: "report", startMs: 0, durationMs: 80 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("markNewData is a no-op before the first report loads", () => {
     expect(activity.lastUpdatedAt).toBeNull();
     activity.markNewData();
@@ -625,6 +717,7 @@ describe("freshness state", () => {
       api.getActivityReport.mockRejectedValueOnce(new Error("network down"));
       await activity.load();
       expect(activity.lastUpdatedAt).toBeNull();
+      expect(activity.lastQueryDurationMs).toBeNull();
       activity.markNewData();
       expect(activity.hasNewData).toBe(false);
     } finally {

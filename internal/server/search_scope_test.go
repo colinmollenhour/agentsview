@@ -63,6 +63,26 @@ func TestSearchContentScopeRequiresSemanticOrHybridMode(t *testing.T) {
 	}
 }
 
+func TestSearchContentTermsAndExactFiltersThroughHTTP(t *testing.T) {
+	te := setup(t)
+	for _, id := range []string{"target-session", "other-session"} {
+		te.seedSession(t, id, "proj", 2, func(s *db.Session) {
+			s.GitBranch = "feature/memory"
+		})
+		te.seedMessages(t, id, 1, func(_ int, m *db.Message) {
+			m.Role = "user"
+			m.Content = "alpha beta"
+		})
+	}
+
+	w := te.get(t, "/api/v1/search/content?pattern=alpha+beta&mode=terms&scope=all"+
+		"&session_id=target-session&git_branch_exact=feature%2Fmemory&include_one_shot=true")
+	assertStatus(t, w, http.StatusOK)
+	res := decode[service.ContentSearchResult](t, w)
+	require.Len(t, res.Matches, 1)
+	assert.Equal(t, "target-session", res.Matches[0].SessionID)
+}
+
 // TestSearchContentScopeFiltersSemanticResults exercises the scope param
 // end to end: scope=top drops the subordinate unit, scope=subordinate
 // keeps only it, and the default returns both even though include_children
@@ -81,10 +101,14 @@ func TestSearchContentScopeFiltersSemanticResults(t *testing.T) {
 		m.Content = "zebra inside the subagent"
 	})
 	te.db.SetVectorSearcher(fakeHitsVectorSearcher{hits: []db.VectorHit{
-		{SessionID: "sub-sess", Ordinal: 0, Subordinate: true, Score: 0.9,
-			Snippet: "zebra inside the subagent"},
-		{SessionID: "top-sess", Ordinal: 0, Score: 0.5,
-			Snippet: "zebra at top level"},
+		{
+			SessionID: "sub-sess", Ordinal: 0, Subordinate: true, Score: 0.9,
+			Snippet: "zebra inside the subagent",
+		},
+		{
+			SessionID: "top-sess", Ordinal: 0, Score: 0.5,
+			Snippet: "zebra at top level",
+		},
 	}})
 
 	search := func(t *testing.T, scope string) []string {
@@ -138,10 +162,14 @@ func TestSearchContentSemanticResponseCarriesUnitRangeAndLineage(t *testing.T) {
 		}
 	})
 	te.db.SetVectorSearcher(fakeHitsVectorSearcher{hits: []db.VectorHit{
-		{SessionID: "sub-sess", Ordinal: 1, OrdinalStart: 1, OrdinalEnd: 2,
-			Subordinate: true, Score: 0.9, Snippet: "zebra step inside the subagent"},
-		{SessionID: "top-sess", Ordinal: 0, Score: 0.5,
-			Snippet: "zebra at top level"},
+		{
+			SessionID: "sub-sess", Ordinal: 1, OrdinalStart: 1, OrdinalEnd: 2,
+			Subordinate: true, Score: 0.9, Snippet: "zebra step inside the subagent",
+		},
+		{
+			SessionID: "top-sess", Ordinal: 0, Score: 0.5,
+			Snippet: "zebra at top level",
+		},
 	}})
 
 	w := te.wrappedRequest(http.MethodGet,

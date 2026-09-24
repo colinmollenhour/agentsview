@@ -28,6 +28,43 @@ auto-update support.
 On macOS, closing the desktop window hides it instead of quitting AgentsView.
 Use the AgentsView menu-bar status item to show the window again, open the logs
 folder, check for updates, or quit the desktop app and its managed backend.
+Clicking its Dock icon or selecting it with Cmd-Tab restores the hidden window.
+
+To keep AgentsView out of the Dock and Cmd-Tab while its window is closed, turn
+on **Hide from Dock and Cmd-Tab when window closed** in the menu-bar menu. This
+option is off by default and stays set across relaunches.
+
+#### macOS: use the bundled CLI
+
+The macOS app includes the `agentsview` CLI at
+`/Applications/AgentsView.app/Contents/MacOS/agentsview`. Homebrew Cask links it
+into Homebrew's `bin` directory automatically.
+
+If you installed the `.app` from a downloaded `.dmg`, move it to Applications,
+then add its CLI to your current shell's `PATH`:
+
+```bash
+export PATH="/Applications/AgentsView.app/Contents/MacOS:$PATH"
+```
+
+Add that same `export` line to `~/.zshrc` to keep it in new Terminal windows
+(or your shell's startup file if you use a different shell). Adjust the path
+if you installed the app elsewhere. The CLI follows updates to the app at that
+location; update it through the desktop app or Homebrew.
+
+Before running the bundled CLI for the first time, open AgentsView from
+Applications in a graphical login session and complete the macOS first-launch
+dialogs. A fresh Homebrew Cask install over SSH has been reported to leave the
+CLI hanging without output until this step is completed. Adding it to `PATH`
+does not replace that first launch. For an unattended Mac, use the
+[standalone CLI installer](#shell-script) instead.
+
+Confirm which CLI your shell finds and check its version:
+
+```bash
+command -v agentsview
+agentsview --version
+```
 
 ### pip / uvx
 
@@ -41,6 +78,9 @@ macOS (x86_64, arm64), and Windows (x86_64, arm64).
 
 ### Shell Script
 
+For macOS and Linux, this installs the standalone CLI without the desktop app.
+Use this path when setting up a Mac over SSH without a graphical login session.
+
 ```bash
 curl -fsSL https://agentsview.io/install.sh | bash
 ```
@@ -53,6 +93,12 @@ powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | i
 
 The installer detects your OS and architecture, downloads the latest release
 from GitHub Releases, verifies the SHA-256 checksum, and installs the binary.
+
+On macOS and Linux, it installs to `/usr/local/bin` when that directory is
+writable, or `~/.local/bin` otherwise. Follow the installer's `PATH` instructions
+and run `command -v agentsview` to check which binary your shell uses. When
+the standalone CLI and bundled CLI use different directories, put the
+standalone install directory first in `PATH` to select it.
 
 !!! note
 
@@ -320,11 +366,16 @@ Once running, the web UI provides:
 - **Session list** with filtering by project, agent, date, and message count
 - **Message viewer** with full content, tool calls, and thinking blocks
 - **Session intelligence** with health grades, outcomes, and signal panels
-- **Full-text search** across all message content
+- **Full-text search** with project and date filters in `Ctrl/Cmd+K`
+- **Open session** by full ID or UUID with `Ctrl/Cmd+G`
 - **Analytics** including activity heatmaps, tool usage, and velocity charts
 - **Activity reporting** with concurrency, agent-minutes, cost, and session rows
 - **Session export** to standalone HTML, markdown export links for agent
   handoff, or GitHub Gist
+
+Use the [Usage Guide](/docs/usage/) for navigation and resume controls. To
+correct project assignments, see the [Data page](/docs/data/) and its opt-in
+project workspace.
 
 Beyond full-text search, opt-in semantic search lets
 `agentsview session search --semantic` (or `--hybrid`) match session content by

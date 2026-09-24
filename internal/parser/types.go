@@ -19,6 +19,7 @@ const (
 	AgentCowork         AgentType = "cowork"
 	AgentCodex          AgentType = "codex"
 	AgentTraeX          AgentType = "traex"
+	AgentAugureCode     AgentType = "augure-code"
 	AgentCopilot        AgentType = "copilot"
 	AgentGemini         AgentType = "gemini"
 	AgentGeminiApps     AgentType = "gemini-apps"
@@ -54,9 +55,11 @@ const (
 	AgentKiroIDE        AgentType = "kiro-ide"
 	AgentCortex         AgentType = "cortex"
 	AgentHermes         AgentType = "hermes"
+	AgentAugureDesktop  AgentType = "augure-desktop"
 	AgentGrok           AgentType = "grok"
 	AgentGoose          AgentType = "goose"
 	AgentWorkBuddy      AgentType = "workbuddy"
+	AgentCodeBuddy      AgentType = "codebuddy"
 	AgentForge          AgentType = "forge"
 	AgentDevin          AgentType = "devin"
 	AgentPiebald        AgentType = "piebald"
@@ -217,6 +220,25 @@ var Registry = []AgentDef{
 		// session_index.jsonl, which TraeX never writes. Watching
 		// ~/.trae/cli shallowly would deliver nothing but churn from the
 		// SQLite WALs TRAE CLI keeps there.
+	},
+	{
+		// Augure Code (augureai.ca) is a closed-source rebrand of codex-rs,
+		// byte-compatible with Codex rollout JSONL, so it reuses the Codex
+		// parser through a relabel hook like TraeX. Sessions live under a
+		// dated YYYY/MM/DD tree at ~/.augure/sessions. Distinct agent because
+		// resuming needs `augure resume` and the rollout UUIDs are a separate
+		// namespace from Codex's.
+		Type:               AgentAugureCode,
+		DisplayName:        "Augure Code",
+		EnvVar:             "AUGURE_CODE_SESSIONS_DIR",
+		ConfigKey:          "augure_code_sessions_dirs",
+		DefaultDirs:        []string{".augure/sessions"},
+		IDPrefix:           "augure-code:",
+		FileBased:          true,
+		PostAnswerToolWork: true,
+		// No ShallowWatchRootsFunc: that hook exists for Codex's sibling
+		// session_index.jsonl, which Augure does not write (verified: none
+		// exists under ~/.augure).
 	},
 	{
 		Type:         AgentCopilot,
@@ -689,11 +711,40 @@ var Registry = []AgentDef{
 		DisplayName:           "Hermes Agent",
 		EnvVar:                "HERMES_SESSIONS_DIR",
 		ConfigKey:             "hermes_sessions_dirs",
-		DefaultDirs:           []string{".hermes/sessions"},
+		DefaultDirs:           []string{".hermes/sessions", "AppData/Local/hermes/sessions"},
 		IDPrefix:              "hermes:",
 		FileBased:             true,
 		WatchRootsFunc:        ResolveHermesWatchRoots,
 		ShallowWatchRootsFunc: ResolveHermesShallowWatchRoots,
+	},
+	{
+		// Augure Desktop v3 embeds a fork of Hermes Agent renamed to
+		// ~/.augure-desktop. The state.db schema matches Hermes's, so the
+		// Hermes state-DB parser is reused through a spec/relabel seam.
+		// Distinct agent because session IDs are a separate namespace from
+		// ~/.hermes and the products version their state.db independently.
+		// The fork marker is the store's own root name (.augure-desktop),
+		// not the schema: default discovery is marker-named so a stock
+		// Hermes store is never claimed, while explicitly configured roots
+		// are trusted as given (TraeX precedent).
+		Type:        AgentAugureDesktop,
+		DisplayName: "Augure Desktop",
+		EnvVar:      "AUGURE_DESKTOP_DIR",
+		ConfigKey:   "augure_desktop_dirs",
+		DefaultDirs: []string{
+			// macOS and Linux (POSIX per hermes_constants.py)
+			".augure-desktop",
+			// Windows
+			"AppData/Local/augure-desktop",
+		},
+		IDPrefix:  "augure-desktop:",
+		FileBased: true,
+		// The fork's roots hold the raw state.db (plus WAL/journal files)
+		// alongside non-transcript application state; copying or sanitizing
+		// the store can retain deleted pages and unrelated state. Remote
+		// sync stays disabled until there is a fresh, allowlisted export
+		// schema, matching the Omnigent chat.db precedent.
+		RemoteSyncExcluded: true,
 	},
 	{
 		Type:        AgentGrok,
@@ -724,6 +775,15 @@ var Registry = []AgentDef{
 		ConfigKey:   "workbuddy_project_dirs",
 		DefaultDirs: []string{".workbuddy/projects"},
 		IDPrefix:    "workbuddy:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentCodeBuddy,
+		DisplayName: "CodeBuddy",
+		EnvVar:      "CODEBUDDY_DIR",
+		ConfigKey:   "codebuddy_dirs",
+		DefaultDirs: codebuddyDefaultDirs(),
+		IDPrefix:    "codebuddy:",
 		FileBased:   true,
 	},
 	{
@@ -1147,8 +1207,9 @@ func AgentIsCopilot(t AgentType) bool {
 	switch t {
 	case AgentCopilot, AgentVSCodeCopilot, AgentVSCopilot:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // AgentNameIsCopilot reports whether the agent name identifies a
@@ -1253,6 +1314,10 @@ const (
 // identifies a non-interactive invocation.
 const SessionKindNonInteractive = "non-interactive"
 
+// SessionKindRoborev marks a Codex session whose session_meta thread_source
+// is the roborev feature tag (`codex exec --thread-source roborev`).
+const SessionKindRoborev = "roborev"
+
 // FileInfo holds file system metadata for a session source file.
 type FileInfo struct {
 	Path   string
@@ -1343,6 +1408,12 @@ type ParsedSession struct {
 	// aggregateTokenPresenceKnown marks session aggregate token
 	// coverage as parser-owned and authoritative.
 	aggregateTokenPresenceKnown bool
+
+	// projectSynthesizedByHermes marks Session.Project as synthesized by
+	// the Hermes state-DB metadata ("hermes" / "hermes-<source>") rather
+	// than a caller-supplied project hint, so fork relabels can rebrand
+	// the producer name without touching explicit hints.
+	projectSynthesizedByHermes bool
 }
 
 // ParsedToolCall holds a single tool invocation extracted from
@@ -1550,8 +1621,7 @@ func applyUsageEventTokenTotals(
 	sess *ParsedSession,
 	events []ParsedUsageEvent,
 ) {
-	totalOutput, hasOutput, peakContext, hasContext :=
-		UsageEventTokenAggregate(events)
+	totalOutput, hasOutput, peakContext, hasContext := UsageEventTokenAggregate(events)
 	if hasOutput {
 		sess.HasTotalOutputTokens = true
 		sess.TotalOutputTokens = totalOutput

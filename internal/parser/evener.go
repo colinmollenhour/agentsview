@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 type evenerHeader struct {
@@ -241,7 +243,7 @@ func parseEvenerSession(ctx context.Context, path, machine string) (*ParsedSessi
 		if msg.Role == RoleUser && msg.Content != "" {
 			sess.UserMessageCount++
 			if sess.FirstMessage == "" {
-				sess.FirstMessage = truncateFirstMessage(msg.Content)
+				sess.FirstMessage = stringutil.TruncateRunes(msg.Content, 300, "")
 			}
 		}
 		if msg.Timestamp.After(sess.EndedAt) {
@@ -267,7 +269,7 @@ func readEvenerSource(ctx context.Context, path string) (evenerTranscript, evene
 		return transcript, meta, present, err
 	}
 	if meta.ParentSessionID != "" && transcript.header.ParentSessionID != "" && meta.ParentSessionID != transcript.header.ParentSessionID {
-		return transcript, meta, present, fmt.Errorf("evener parent identities disagree")
+		return transcript, meta, present, errors.New("evener parent identities disagree")
 	}
 	return transcript, meta, present, nil
 }
@@ -309,10 +311,10 @@ func readEvenerTranscript(ctx context.Context, path string) (evenerTranscript, e
 				return out, fmt.Errorf("decode Evener header: %w", err)
 			}
 			if out.header.Kind != "header" || out.header.FormatVersion != 2 {
-				return out, fmt.Errorf("unsupported Evener transcript: require semantic format_version 2")
+				return out, errors.New("unsupported Evener transcript: require semantic format_version 2")
 			}
 			if out.header.SessionID == "" || filepath.Base(path) != out.header.SessionID+".transcript.jsonl" {
-				return out, fmt.Errorf("evener filename and header identity disagree")
+				return out, errors.New("evener filename and header identity disagree")
 			}
 			headerSeen = true
 			continue
@@ -341,7 +343,7 @@ func readEvenerTranscript(ctx context.Context, path string) (evenerTranscript, e
 		out.entries = append(out.entries, evenerEntry{turn: turn, raw: envelope.Turn})
 	}
 	if !headerSeen {
-		return out, fmt.Errorf("unsupported Evener transcript: missing complete v2 header")
+		return out, errors.New("unsupported Evener transcript: missing complete v2 header")
 	}
 	return out, ctx.Err()
 }
@@ -362,7 +364,7 @@ func readEvenerLine(reader *bufio.Reader) ([]byte, bool, error) {
 		}
 		if err == nil {
 			if oversized {
-				return nil, false, fmt.Errorf("record exceeds 128 MiB")
+				return nil, false, errors.New("record exceeds 128 MiB")
 			}
 			return line, true, nil
 		}
@@ -553,7 +555,7 @@ func readEvenerMeta(path string) (evenerMeta, bool, error) {
 		return meta, false, fmt.Errorf("read Evener metadata: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return meta, true, fmt.Errorf("evener metadata is not a regular file")
+		return meta, true, errors.New("evener metadata is not a regular file")
 	}
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
@@ -563,7 +565,7 @@ func readEvenerMeta(path string) (evenerMeta, bool, error) {
 		return meta, true, fmt.Errorf("decode Evener metadata: %w", err)
 	}
 	if meta.ID == "" || filepath.Base(path) != meta.ID+".transcript.jsonl" {
-		return meta, true, fmt.Errorf("evener metadata identity does not match transcript")
+		return meta, true, errors.New("evener metadata identity does not match transcript")
 	}
 	return meta, true, nil
 }

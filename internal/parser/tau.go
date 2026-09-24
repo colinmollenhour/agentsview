@@ -3,7 +3,7 @@ package parser
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -330,8 +330,7 @@ func decodeTauMessage(
 			SourceParentUUID: parent,
 		}
 	case "assistant":
-		content, thinking, hasThinking, hasToolUse, toolCalls :=
-			tauExtractContent(message.Get("content"))
+		content, thinking, hasThinking, hasToolUse, toolCalls := tauExtractContent(message.Get("content"))
 		if content == "" && message.Get("errorMessage").Str != "" {
 			content = message.Get("errorMessage").Str
 		}
@@ -466,7 +465,7 @@ func applyTauUsage(pm *ParsedMessage, usage gjson.Result) {
 	if len(normalized) == 0 {
 		return
 	}
-	encoded, err := json.Marshal(normalized)
+	encoded, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

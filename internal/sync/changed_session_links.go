@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -23,7 +24,7 @@ func (ids changedSessionLinks) observe(job syncJob, prefix string) {
 
 // link runs with syncMu held. A failure leaves the global link pending so an
 // unchanged poll retries it even when the durable repair queue also failed.
-func (ids changedSessionLinks) link(e *Engine) error {
+func (ids changedSessionLinks) link(ctx context.Context, e *Engine) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -32,10 +33,10 @@ func (ids changedSessionLinks) link(e *Engine) error {
 		sessionIDs = append(sessionIDs, id)
 	}
 	slices.Sort(sessionIDs)
-	if err := e.db.LinkSubagentSessionsForSessions(sessionIDs); err != nil {
+	if err := e.db.LinkSubagentSessionsForSessions(ctx, sessionIDs); err != nil {
 		e.subagentLinkPending = true
 		linkErr := fmt.Errorf("link affected subagent sessions: %w", err)
-		if queueErr := e.db.QueueSubagentParentRepairs(sessionIDs); queueErr != nil {
+		if queueErr := e.db.QueueSubagentParentRepairs(ctx, sessionIDs); queueErr != nil {
 			return errors.Join(linkErr,
 				fmt.Errorf("queue affected subagent parent repairs: %w", queueErr))
 		}

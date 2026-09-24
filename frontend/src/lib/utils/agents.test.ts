@@ -15,6 +15,8 @@ describe("KNOWN_AGENTS", () => {
       "cowork",
       "codex",
       "traex",
+      "augure-code",
+      "augure-desktop",
       "copilot",
       "devin",
       "evener",
@@ -51,6 +53,7 @@ describe("KNOWN_AGENTS", () => {
       "kiro-ide",
       "cortex",
       "workbuddy",
+      "codebuddy",
       "qoder",
       "piebald",
       "antigravity",
@@ -78,6 +81,8 @@ describe("agentColor", () => {
     expect(agentColor("claude")).toBe("var(--accent-blue)");
     expect(agentColor("codex")).toBe("var(--accent-green)");
     expect(agentColor("traex")).toBe("var(--accent-coral)");
+    expect(agentColor("augure-code")).toBe("var(--accent-lime)");
+    expect(agentColor("augure-desktop")).toBe("var(--accent-violet)");
     expect(agentColor("copilot")).toBe("var(--accent-amber)");
     expect(agentColor("devin")).toBe("var(--accent-red)");
     expect(agentColor("evener")).toBe("var(--accent-teal)");
@@ -100,6 +105,7 @@ describe("agentColor", () => {
     expect(agentColor("visualstudio-copilot")).toBe("var(--accent-blue)");
     expect(agentColor("qclaw")).toBe("var(--accent-orange)");
     expect(agentColor("workbuddy")).toBe("var(--accent-violet)");
+    expect(agentColor("codebuddy")).toBe("var(--accent-blue)");
     expect(agentColor("piebald")).toBe("var(--accent-orange)");
     expect(agentColor("roocode")).toBe("var(--accent-rose)");
     expect(agentColor("omnigent")).toBe("var(--accent-teal)");
@@ -164,6 +170,7 @@ describe("agentLabel", () => {
     expect(agentLabel("iflow")).toBe("iFlow");
     expect(agentLabel("kimi-work")).toBe("Kimi Work");
     expect(agentLabel("workbuddy")).toBe("WorkBuddy");
+    expect(agentLabel("codebuddy")).toBe("CodeBuddy");
     expect(agentLabel("piebald")).toBe("Piebald");
     expect(agentLabel("zed")).toBe("Zed");
     expect(agentLabel("qwen")).toBe("Qwen Code");
@@ -175,6 +182,8 @@ describe("agentLabel", () => {
     expect(agentLabel("roocode")).toBe("RooCode");
     expect(agentLabel("omnigent")).toBe("Omnigent");
     expect(agentLabel("traex")).toBe("TraeX");
+    expect(agentLabel("augure-code")).toBe("Augure Code");
+    expect(agentLabel("augure-desktop")).toBe("Augure Desktop");
     expect(agentLabel("opencodereview")).toBe("Open Code Review");
     expect(agentLabel("crush")).toBe("Charm Crush");
   });

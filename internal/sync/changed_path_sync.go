@@ -163,9 +163,9 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		},
 	)
 	if !stats.Aborted {
-		if err := affectedSessionIDs.link(e); err != nil {
+		if err := affectedSessionIDs.link(ctx, e); err != nil {
 			stats.RecordFailed()
-			processErr = err
+			processErr = errors.Join(processErr, err)
 		}
 	}
 	e.anomalies.applyTo(&stats)
@@ -177,7 +177,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	}
 	e.finishSQLiteContainerPass(true, false)
 	if !e.ephemeral {
-		e.persistSkipCache()
+		e.persistSkipCache(ctx)
 	}
 	e.mu.Lock()
 	e.lastSync = time.Now()

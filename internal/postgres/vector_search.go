@@ -9,15 +9,10 @@ import (
 	"sync"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
 	"go.kenn.io/agentsview/internal/vector"
+	kitvec "go.kenn.io/kit/vector"
 )
-
-// QueryEncodeFunc embeds a single query string into the generation's vector
-// space. It is the read-side counterpart of the build-time encoder, supplied
-// by pg serve when it wires the searcher; a returned error means the
-// embeddings endpoint failed for this request (transient), not that semantic
-// search is unconfigured.
-type QueryEncodeFunc func(ctx context.Context, text string) ([]float32, error)
 
 // vectorSearcher is the PG-backed db.VectorSearcher: chunk-level KNN over one
 // generation's pgvector chunk table, doc-level rollup, and hydration against
@@ -28,7 +23,7 @@ type vectorSearcher struct {
 	genID         int64
 	dimension     int
 	maxInputChars int
-	encode        QueryEncodeFunc
+	encode        storage.VectorQueryEncoder
 	chunkTable    string
 
 	// schemaMu guards the lazily resolved, quoted pgvector extension schema.
@@ -45,7 +40,7 @@ type vectorSearcher struct {
 // phase created; maxInputChars is the build-time chunk size, threaded into
 // vector.DocAnchor so anchor/snippet re-splitting matches how chunks were cut.
 func NewVectorSearcher(
-	pg *sql.DB, genID int64, dimension, maxInputChars int, encode QueryEncodeFunc,
+	pg *sql.DB, genID int64, dimension, maxInputChars int, encode storage.VectorQueryEncoder,
 ) db.VectorSearcher {
 	return &vectorSearcher{
 		pg:            pg,
@@ -86,7 +81,7 @@ func (v *vectorSearcher) SemanticSearch(
 ) ([]db.VectorHit, error) {
 	vec, err := v.encode(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", db.ErrSemanticTransient, err)
+		return nil, fmt.Errorf("%w: %w", db.ErrSemanticTransient, err)
 	}
 	if len(vec) != v.dimension {
 		return nil, fmt.Errorf(
@@ -101,7 +96,10 @@ func (v *vectorSearcher) SemanticSearch(
 	if err != nil {
 		return nil, err
 	}
-	docs := rollupChunkHits(chunks, limit)
+	docs := kitvec.RollupByDocument(chunks)
+	if limit >= 0 && len(docs) > limit {
+		docs = docs[:limit]
+	}
 	if len(docs) == 0 {
 		return nil, nil
 	}
@@ -111,11 +109,7 @@ func (v *vectorSearcher) SemanticSearch(
 // chunkHit is one chunk-level KNN neighbor: the document it belongs to, which
 // chunk matched, and its cosine similarity (1 - cosine distance, higher is
 // better).
-type chunkHit struct {
-	docKey     string
-	chunkIndex int
-	score      float32
-}
+type chunkHit = kitvec.Hit[string]
 
 // knnChunks runs the chunk-level KNN, returning up to exactly limit neighbors
 // ordered best (nearest) first. Fetching exactly `limit` chunks matches the
@@ -164,16 +158,17 @@ SELECT doc_key, chunk_index, 1 - (%s) AS score
 	if err != nil {
 		return nil, fmt.Errorf("chunk knn query: %w", err)
 	}
+	defer rows.Close()
 	defer func() { _ = rows.Close() }()
 
 	var hits []chunkHit
 	for rows.Next() {
 		var h chunkHit
 		var score float64
-		if err := rows.Scan(&h.docKey, &h.chunkIndex, &score); err != nil {
+		if err := rows.Scan(&h.Doc, &h.ChunkIndex, &score); err != nil {
 			return nil, fmt.Errorf("scanning chunk knn row: %w", err)
 		}
-		h.score = float32(score)
+		h.Score = float32(score)
 		hits = append(hits, h)
 	}
 	if err := rows.Err(); err != nil {
@@ -232,27 +227,6 @@ func tuneHNSWRecall(ctx context.Context, tx *sql.Tx, k int) error {
 	return nil
 }
 
-// rollupChunkHits collapses chunk hits to one hit per document, keeping the
-// first (best) chunk seen per doc_key and preserving order, then truncates to
-// limit documents. hits must already be ordered best-first (the KNN query
-// orders by distance), so first-seen equals best-scoring — matching kit's
-// RollupByDocument intent without a re-sort.
-func rollupChunkHits(hits []chunkHit, limit int) []chunkHit {
-	seen := make(map[string]struct{}, len(hits))
-	out := make([]chunkHit, 0, len(hits))
-	for _, h := range hits {
-		if _, ok := seen[h.docKey]; ok {
-			continue
-		}
-		seen[h.docKey] = struct{}{}
-		out = append(out, h)
-	}
-	if limit >= 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
-}
-
 // vectorDoc is the subset of a vector_documents row needed to hydrate a chunk
 // hit into a db.VectorHit. offsets is empty for user documents and carries one
 // entry per member for run documents.
@@ -276,7 +250,7 @@ func (v *vectorSearcher) hydrateHits(
 ) ([]db.VectorHit, error) {
 	docKeys := make([]string, len(hits))
 	for i, h := range hits {
-		docKeys[i] = h.docKey
+		docKeys[i] = h.Doc
 	}
 	docs, err := v.lookupDocs(ctx, docKeys)
 	if err != nil {
@@ -285,19 +259,19 @@ func (v *vectorSearcher) hydrateHits(
 
 	out := make([]db.VectorHit, 0, len(hits))
 	for _, h := range hits {
-		doc, ok := docs[h.docKey]
+		doc, ok := docs[h.Doc]
 		if !ok {
 			continue
 		}
 		anchorOrdinal, snippet := vector.DocAnchor(
-			doc.content, doc.offsets, doc.ordinal, h.chunkIndex, v.maxInputChars)
+			doc.content, doc.offsets, doc.ordinal, h.ChunkIndex, v.maxInputChars)
 		out = append(out, db.VectorHit{
 			SessionID:    doc.sessionID,
 			Ordinal:      anchorOrdinal,
 			OrdinalStart: doc.ordinal,
 			OrdinalEnd:   doc.ordinalEnd,
 			Subordinate:  doc.subordinate,
-			Score:        h.score,
+			Score:        h.Score,
 			Snippet:      snippet,
 		})
 	}
@@ -324,6 +298,7 @@ SELECT doc_key, session_id, ordinal, ordinal_end, subordinate, offsets, content
 	if err != nil {
 		return nil, fmt.Errorf("looking up search hit documents: %w", err)
 	}
+	defer rows.Close()
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
@@ -368,6 +343,7 @@ SELECT doc_key, ordinal, ordinal_end, subordinate
 	if err != nil {
 		return nil, fmt.Errorf("resolve message units: %w", err)
 	}
+	defer stmt.Close()
 	defer func() { _ = stmt.Close() }()
 
 	for i, ref := range refs {

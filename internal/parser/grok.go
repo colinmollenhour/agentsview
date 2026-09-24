@@ -17,20 +17,21 @@ import (
 )
 
 type grokSummaryFields struct {
-	Summary            string
-	FirstPrompt        string
-	ModelID            string
-	CreatedAt          string
-	UpdatedAt          string
-	LastActiveAt       string
-	Hostname           string
-	NumMessages        int
-	WorktreeLabel      string
-	GitRootDir         string
-	Cwd                string
-	HeadBranch         string
-	ParentSessionID    string
-	SourceWorkspaceDir string
+	Summary             string
+	FirstPrompt         string
+	ModelID             string
+	CreatedAt           string
+	UpdatedAt           string
+	LastActiveAt        string
+	Hostname            string
+	NumMessages         int
+	WorktreeLabel       string
+	GitRootDir          string
+	Cwd                 string
+	HeadBranch          string
+	ParentSessionID     string
+	SourceWorkspaceDir  string
+	ProducerSessionKind string
 }
 
 type grokSignalMetrics struct {
@@ -85,7 +86,12 @@ func ParseGrokSummary(
 	endedAt := grokEndedAt(summary)
 	parentSessionID := strings.TrimSpace(summary.ParentSessionID)
 	relationshipType := RelNone
-	if parentSessionID != "" {
+	if subagentParent, _, ok := grokSubagentParentFromDisk(
+		sessionDir, summary.ProducerSessionKind,
+	); ok {
+		parentSessionID = "grok:" + subagentParent
+		relationshipType = RelSubagent
+	} else if parentSessionID != "" {
 		parentSessionID = "grok:" + parentSessionID
 		relationshipType = RelFork
 	}
@@ -104,6 +110,7 @@ func ParseGrokSummary(
 	}
 	enrichGrokMessageTimestamps(messages, timestampAnchors)
 	enrichGrokToolResultEvents(messages, timestampAnchors)
+	grokAttachSpawnedSubagents(messages)
 
 	firstPrompt := ""
 	for _, msg := range messages {
@@ -960,18 +967,18 @@ func grokStripMetaUserBlocks(text string) string {
 // unclosed opening tag drops the remainder of the string from that point.
 func grokStripXMLTagBlock(text, tag string) string {
 	open := "<" + tag + ">"
-	close := "</" + tag + ">"
+	closing := "</" + tag + ">"
 	for {
 		start := strings.Index(text, open)
 		if start < 0 {
 			return text
 		}
 		rest := text[start+len(open):]
-		endRel := strings.Index(rest, close)
+		endRel := strings.Index(rest, closing)
 		if endRel < 0 {
 			return strings.TrimSpace(text[:start])
 		}
-		end := start + len(open) + endRel + len(close)
+		end := start + len(open) + endRel + len(closing)
 		text = text[:start] + text[end:]
 	}
 }
@@ -1135,6 +1142,9 @@ func decodeGrokSummary(data []byte) grokSummaryFields {
 		),
 		SourceWorkspaceDir: strings.TrimSpace(
 			root.Get("source_workspace_dir").String(),
+		),
+		ProducerSessionKind: strings.TrimSpace(
+			root.Get("session_kind").String(),
 		),
 	}
 }

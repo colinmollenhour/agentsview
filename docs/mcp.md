@@ -1,4 +1,5 @@
 ---
+last_edited: 2026-09-21
 title: MCP Server
 description: Connect assistant clients to your AgentsView session history with MCP
 ---
@@ -62,7 +63,7 @@ client will see these tools:
 | `list_sessions`        | List recent or filtered sessions                                         |
 | `get_session_overview` | Fetch metadata and a compact message preview                             |
 | `get_messages`         | Read paginated message bodies from one session                           |
-| `search_content`       | Substring, regex, semantic, or hybrid search over raw session text       |
+| `search_content`       | Substring, regex, terms, semantic, or hybrid search over session text    |
 | `get_usage_summary`    | Aggregate token and cost usage                                           |
 | `query_recall`         | Search extracted Recall entries when the backend supports Recall queries |
 
@@ -72,6 +73,10 @@ include sessions whose activity overlaps the requested days in UTC. Either bound
 can be omitted; omitting both preserves unrestricted date matching. Malformed
 dates and ranges where `date_from` is after `date_to` return an error.
 
+HTTP-backed session and search results include `web_url` when a browser address
+is available. Use that link when citing a session; it preserves the server's
+base path. Direct PostgreSQL reads omit it.
+
 Set `session_id` to a raw UUID or full stored session ID when you need one
 session. The lookup returns one metadata row, includes active sessions, ignores
 the other search arguments, and returns an error when the ID is missing or its
@@ -80,13 +85,20 @@ an agent ID ending in `:<uuid>`, or a host ID ending in `~<uuid>`; the delimiter
 is part of the match, so a fork entry separated by `-` is not selected. The row
 has an empty `snippet`, `match_ordinal` set to `0`, and no `next_cursor`. Call
 `get_messages` with that ordinal to read the first message. For a known full ID,
-`get_session_overview` remains the way to get a compact message preview.
-Remote bare UUID lookup requires an updated server; an exact full stored ID still
-uses the existing `Get` path.
+`get_session_overview` remains the way to get a compact message preview. Remote
+bare UUID lookup requires AgentsView 0.44.0 or later on the server. Use an exact
+full stored ID with an older server.
 
 `search_sessions` and `search_content` exclude sessions active in the last ten
 minutes by default, including the current conversation. Set
-`include_active: true` when you need that recent work.
+`include_active: true` when you need that recent work. For recall from a known
+conversation, pass its full ID as `current_session_id`; `search_content` then
+excludes only that session before applying the result limit and does not hide
+other recent work.
+
+`search_content` also excludes one-shot and automated sessions by default. Set
+`include_one_shot: true` or `include_automated: true` to include those classes.
+An empty result can therefore omit a matching one-shot or automated session.
 
 When a vector search index is configured, prefer `search_content` with
 `mode: "hybrid"` or `mode: "semantic"` for questions about prior work,
@@ -96,15 +108,52 @@ If the index is unavailable, use `search_sessions` for keyword search, or
 `search_content` with substring/regex for exact errors, identifiers, and code
 fragments. The default search mode remains substring.
 
-`search_content` accepts a `mode` of `substring` (default), `regex`, `semantic`,
-or `hybrid`, plus a `scope` of `top`, `all` (default), or `subordinate` that is
-only valid with the semantic and hybrid modes. The `semantic` and `hybrid` modes
-need the opt-in [semantic search](/docs/semantic-search/) index on the local
-SQLite archive; without it they return a "not available" error. In every mode,
-each match carries a conversation-unit citation: an `ordinal_range` of
+`search_content` accepts a `mode` of `substring` (default), `regex`, `terms`,
+`semantic`, or `hybrid`. `terms` splits `pattern` on whitespace and requires
+every literal term to occur within one exchange: a user message and its ensuing
+assistant run on the same main or sidechain branch. Terms can appear on opposite
+sides of that exchange. Assistant messages before a session's first user message
+belong to no exchange and never match. `%`, `_`, and backslashes stay literal;
+tool and system content is outside this mode. The `terms` mode currently
+requires a SQLite or PostgreSQL backend.
+
+`scope` can be `top`, `all` (default), or `subordinate` for terms, semantic, and
+hybrid searches. The semantic and hybrid modes need the opt-in
+[semantic search](/docs/semantic-search/) index on the local SQLite archive;
+without it they return a "not available" error. Exact `session_id`,
+`git_branch`, `project`, `agent`, `date_from`, and `date_to` filters apply
+before the final limit. Limits default to 10 and go up to 50; a value outside
+that range falls back to the default.
+
+A `terms` snippet shows about 60 characters of context around the first
+occurrence of each term. Terms that sit far apart in a long exchange produce
+separate windows joined by `...`, so snippet size follows the number of terms,
+not the length of the exchange.
+
+Every match carries a conversation-unit citation: an `ordinal_range` of
 `[start, end]` ordinals around the match, plus `subordinate`, `relationship`,
 `parent_session_id`, and `is_sidechain` fields that flag hits from sidechain
-runs and subagent or fork sessions.
+runs and subagent or fork sessions. The response also reports the
+`effective_mode`, the `effective_scope` for modes that support scope, and the
+`exclusions` that applied by default. `next_cursor` is present when another page
+exists.
+
+SQLite and PostgreSQL search matches also carry `transcript_revision`, captured
+by the same storage query as the evidence. A `revision_bound` response flag says
+whether every returned match has that guarantee. Pass a match's revision as
+`expected_revision` when calling `get_messages`. If the transcript changed in
+between, the read returns `source_changed`; repeat the search and use the new
+citation.
+
+`get_messages` returns the revision observed for its page. A message longer than
+`max_chars_per_message` has a `body_cursor`; keep calling `get_messages` with
+that cursor before following `next_from`. The opaque cursor stays bound to the
+archive instance, session, revision, message ordinal, and next content offset,
+so it cannot silently continue against replaced transcript content. A cursor
+stops working when the archive server restarts. If a continuation fails with
+`source_changed` or `invalid body_cursor`, start a fresh `get_messages` listing.
+Role and system filtering still happens after each scanned page, so an empty or
+short page can have a `next_from` and should be continued.
 
 ## Daemon-Backed Reads
 

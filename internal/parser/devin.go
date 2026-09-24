@@ -134,7 +134,7 @@ func openDevinDB(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-func getDevinSessionMeta(
+func getDevinSessionMeta(ctx context.Context,
 	dbPath, rawSessionID string,
 ) (*DevinSessionMeta, error) {
 	db, err := openDevinDB(dbPath)
@@ -166,7 +166,7 @@ func getDevinSessionMeta(
 		legacyQuery  = queryPrefix + "NULL" + querySuffix
 	)
 	query := func(statement string) error {
-		return db.QueryRow(statement, rawSessionID).Scan(
+		return db.QueryRowContext(ctx, statement, rawSessionID).Scan(
 			&meta.RawSessionID,
 			&meta.Title,
 			&meta.CWD,
@@ -178,13 +178,13 @@ func getDevinSessionMeta(
 		)
 	}
 	err = query(currentQuery)
-	if err != nil && err != sql.ErrNoRows &&
-		devinSessionsTablePredatesMainChainID(db) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) &&
+		devinSessionsTablePredatesMainChainID(ctx, db) {
 		meta.MainChainID = sql.NullInt64{}
 		err = query(legacyQuery)
 	}
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("loading devin session meta: %w", err)
@@ -204,9 +204,9 @@ func getDevinSessionMeta(
 // from other query failures without relying on SQLite's error text. It runs
 // only after the current metadata query fails, so current databases keep the
 // single-query read path.
-func devinSessionsTablePredatesMainChainID(db *sql.DB) bool {
+func devinSessionsTablePredatesMainChainID(ctx context.Context, db *sql.DB) bool {
 	var tableExists, columnExists int
-	err := db.QueryRow(`
+	err := db.QueryRowContext(ctx, `
 		SELECT EXISTS (
 		           SELECT 1
 		             FROM sqlite_schema
@@ -305,8 +305,8 @@ func devinRedactedSessionID() string {
 	return "<redacted-session-id>"
 }
 
-func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []ParsedMessage, error) {
-	meta, err := getDevinSessionMeta(dbPath, rawSessionID)
+func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string) (*ParsedSession, []ParsedMessage, error) {
+	meta, err := getDevinSessionMeta(ctx, dbPath, rawSessionID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -321,7 +321,7 @@ func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []
 			return nil, nil, newDevinTranscriptError("stat", err)
 		}
 		fallbackErr := newDevinTranscriptError("missing", nil)
-		sess, msgs, ok, err := parseDevinSessionFromMessageNodes(dbPath, rawSessionID, machine, meta)
+		sess, msgs, ok, err := parseDevinSessionFromMessageNodes(ctx, dbPath, rawSessionID, machine, meta)
 		if err == nil && ok {
 			return sess, msgs, nil
 		}
@@ -363,7 +363,7 @@ func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []
 	)
 
 	steps.ForEach(func(_, step gjson.Result) bool {
-		msg, ok := parseDevinStep(step, stepOrdinal, model)
+		msg, ok := parseDevinStep(rawSessionID, step, stepOrdinal, model)
 		stepOrdinal++
 		if !ok {
 			return true
@@ -407,11 +407,11 @@ func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []
 	return sess, messages, nil
 }
 
-func parseDevinSessionFromMessageNodes(
+func parseDevinSessionFromMessageNodes(ctx context.Context,
 	dbPath, rawSessionID, machine string,
 	meta *DevinSessionMeta,
 ) (*ParsedSession, []ParsedMessage, bool, error) {
-	rows, err := listDevinMessageNodes(dbPath, rawSessionID)
+	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -432,7 +432,7 @@ func parseDevinSessionFromMessageNodes(
 		userMsgCount int
 	)
 	for _, row := range chain {
-		msg, ok, err := parseDevinDBMessageNode(row, len(messages), model)
+		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(messages), model)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -528,14 +528,14 @@ type devinMessageNodeRow struct {
 	CreatedAt    int64
 }
 
-func listDevinMessageNodes(dbPath, rawSessionID string) ([]devinMessageNodeRow, error) {
+func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]devinMessageNodeRow, error) {
 	db, err := openDevinDB(dbPath)
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 
-	rows, err := db.Query(`
+	rows, err := db.QueryContext(ctx, `
 		SELECT row_id,
 		       node_id,
 		       parent_node_id,
@@ -565,6 +565,7 @@ func listDevinMessageNodes(dbPath, rawSessionID string) ([]devinMessageNodeRow, 
 }
 
 func parseDevinDBMessageNode(
+	rawSessionID string,
 	row devinMessageNodeRow,
 	ordinal int,
 	model string,
@@ -599,8 +600,7 @@ func parseDevinDBMessageNode(
 		}
 	}
 
-	tokenUsage, contextTokens, outputTokens, hasContextTokens, hasOutputTokens :=
-		devinTokenUsageFromNodeMetrics(root.Get("metadata.metrics"))
+	tokenUsage, contextTokens, outputTokens, hasContextTokens, hasOutputTokens := devinTokenUsageFromNodeMetrics(root.Get("metadata.metrics"))
 
 	// The per-message generation model is the authoritative model for both
 	// display and pricing: the session-level sessions.model column is often
@@ -637,12 +637,20 @@ func parseDevinDBMessageNode(
 		OutputTokens:     outputTokens,
 		HasContextTokens: hasContextTokens,
 		HasOutputTokens:  hasOutputTokens,
-		SourceUUID:       fmt.Sprintf("%d", row.NodeID),
+		SourceUUID:       devinNodeSourceUUID(rawSessionID, row.NodeID),
 	}
 	if row.ParentNodeID.Valid {
-		msg.SourceParentUUID = fmt.Sprintf("%d", row.ParentNodeID.Int64)
+		msg.SourceParentUUID = devinNodeSourceUUID(rawSessionID, row.ParentNodeID.Int64)
 	}
 	return msg, true, nil
+}
+
+// devinNodeSourceUUID scopes a message_nodes identity to its session. Devin's
+// node_id is a per-session sequence (UNIQUE(session_id, node_id)), so bare ids
+// collide across sessions in usage deduplication; prefixing the session id
+// makes the source identity global.
+func devinNodeSourceUUID(rawSessionID string, nodeID int64) string {
+	return fmt.Sprintf("%s:%d", rawSessionID, nodeID)
 }
 
 // devinTokenUsageFromNodeMetrics reads the per-assistant-message token counters
@@ -957,14 +965,13 @@ func positiveGJSONInt(value gjson.Result) (int, bool) {
 	return 0, false
 }
 
-func parseDevinStep(step gjson.Result, ordinal int, model string) (ParsedMessage, bool) {
+func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model string) (ParsedMessage, bool) {
 	role, isSystem, ok := devinRoleForSource(step.Get("source").Str)
 	if !ok {
 		return ParsedMessage{}, false
 	}
 
-	content, thinking, hasThinking, hasToolUse, toolCalls, toolResults :=
-		ExtractTextContent(context.Background(), step.Get("message"))
+	content, thinking, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(context.Background(), step.Get("message"))
 	topLevelToolText, topLevelToolCalls := formatTopLevelToolUses(step.Get("tool_use"))
 	if topLevelToolText != "" {
 		content = joinNonEmpty(content, topLevelToolText)
@@ -980,8 +987,7 @@ func parseDevinStep(step gjson.Result, ordinal int, model string) (ParsedMessage
 		role = RoleTool
 		isSystem = false
 	}
-	tokenUsage, contextTokens, outputTokens, hasContextTokens, hasOutputTokens :=
-		devinTokenUsageFromMetrics(step.Get("metrics"))
+	tokenUsage, contextTokens, outputTokens, hasContextTokens, hasOutputTokens := devinTokenUsageFromMetrics(step.Get("metrics"))
 	messageModel := firstNonEmpty(
 		step.Get("extra.generation_model").Str,
 		step.Get("model_name").Str,
@@ -1006,7 +1012,7 @@ func parseDevinStep(step gjson.Result, ordinal int, model string) (ParsedMessage
 		OutputTokens:     outputTokens,
 		HasContextTokens: hasContextTokens,
 		HasOutputTokens:  hasOutputTokens,
-		SourceUUID:       devinStepID(step.Get("step_id")),
+		SourceUUID:       devinStepSourceUUID(rawSessionID, step.Get("step_id")),
 	}, true
 }
 
@@ -1060,6 +1066,17 @@ func nonNegativeGJSONInt(value gjson.Result) (int, bool) {
 		return 0, true
 	}
 	return n, true
+}
+
+// devinStepSourceUUID scopes a transcript step_id the way
+// devinNodeSourceUUID scopes node_id: step_id is also a per-session sequence.
+// A step without a usable step_id yields "" rather than a bare prefix.
+func devinStepSourceUUID(rawSessionID string, stepID gjson.Result) string {
+	id := devinStepID(stepID)
+	if id == "" {
+		return ""
+	}
+	return rawSessionID + ":" + id
 }
 
 func devinStepID(stepID gjson.Result) string {

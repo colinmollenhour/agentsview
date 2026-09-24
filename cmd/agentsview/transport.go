@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 	"go.kenn.io/agentsview/internal/update"
 )
 
@@ -40,8 +42,10 @@ var errLocalDaemonUnreachable = errors.New(
 	"local daemon owns the SQLite archive but is not responding",
 )
 
-var startBackgroundServeForTransport = autoStartBackgroundServe
-var waitForDaemonStartupForTransport = WaitForDaemonStartupContext
+var (
+	startBackgroundServeForTransport = autoStartBackgroundServe
+	waitForDaemonStartupForTransport = WaitForDaemonStartupContext
+)
 
 // autoStartBackgroundServe guards transport auto-start against test
 // binaries: os.Executable inside `go test` is the test executable, so a
@@ -71,7 +75,9 @@ type transport struct {
 	ReadOnly           bool // daemon runtime ReadOnly flag (true for pg serve)
 	DirectReadOnly     bool // writable daemon owns DB but is not reachable
 	DirectIncompatible bool // live daemon owns DB but cannot serve this client
+	DirectDaemonAhead  bool // that daemon runs a newer API or data version than this client
 	DirectReason       string
+	DirectError        error
 	Runtime            *DaemonRuntime
 }
 
@@ -84,9 +90,8 @@ var openPGReadStore = func(
 	pgCfg config.PGConfig,
 ) (db.Store, func(), error) {
 	applyClassifierConfig(cfg)
-	store, err := postgres.NewStore(
-		pgCfg.URL, pgCfg.Schema, pgCfg.AllowInsecure,
-	)
+	backend := pgReplica{}
+	store, err := backend.OpenStore(postgres.ReplicaTarget(pgCfg))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -157,17 +162,23 @@ func detectTransportContext(
 		}
 	}
 	if IsLocalDaemonActive(dataDir, authToken) {
-		reason := errLocalDaemonUnreachable.Error()
+		directErr := errLocalDaemonUnreachable
+		reason := directErr.Error()
 		incompatible := false
-		if _, err := FindIncompatibleDaemonRuntime(dataDir, authToken); err != nil {
+		ahead := false
+		if rt, err := FindIncompatibleDaemonRuntime(dataDir, authToken); err != nil {
 			reason = err.Error()
+			directErr = err
 			incompatible = true
+			ahead = daemonRuntimeAhead(rt)
 		}
 		return transport{
 			Mode:               transportDirect,
 			DirectReadOnly:     true,
 			DirectIncompatible: incompatible,
+			DirectDaemonAhead:  ahead,
 			DirectReason:       reason,
+			DirectError:        directErr,
 		}, nil
 	}
 	return transport{Mode: transportDirect}, nil
@@ -284,11 +295,11 @@ func ensureTransportContext(
 		}
 		if tr.DirectReadOnly {
 			if tr.DirectReason != "" {
-				if tr.DirectReason == errLocalDaemonUnreachable.Error() {
+				if errors.Is(tr.DirectError, errLocalDaemonUnreachable) {
 					return transport{}, errLocalDaemonUnreachable
 				}
-				return transport{}, appendDaemonRestartUpgradeHint(
-					errors.New(tr.DirectReason),
+				return transport{}, appendDaemonCompatibilityHint(
+					tr, errors.New(tr.DirectReason),
 				)
 			}
 			return transport{}, errLocalDaemonUnreachable
@@ -303,14 +314,27 @@ func ensureTransportContext(
 		return transportFromRuntime(rt), nil
 	}
 	if daemonAutostartDisabled() {
+		if tr.DirectIncompatible {
+			// AGENTSVIEW_NO_DAEMON never replaces a live daemon, so a
+			// client that cannot talk to the one it found has no path
+			// forward. Name the real reason instead of letting the
+			// write backend report the daemon as "not responding".
+			return transport{}, fmt.Errorf(
+				"local daemon owns the SQLite archive but cannot serve "+
+					"this client: %s; refusing to write directly",
+				tr.DirectReason,
+			)
+		}
 		return tr, nil
 	}
 	if tr.DirectReadOnly {
 		if tr.DirectReason != "" {
-			if tr.DirectReason == errLocalDaemonUnreachable.Error() {
+			if errors.Is(tr.DirectError, errLocalDaemonUnreachable) {
 				return transport{}, errLocalDaemonUnreachable
 			}
-			return transport{}, errors.New(tr.DirectReason)
+			return transport{}, appendDaemonCompatibilityHint(
+				tr, errors.New(tr.DirectReason),
+			)
 		}
 		return transport{}, errLocalDaemonUnreachable
 	}
@@ -353,6 +377,9 @@ func waitForBackgroundLaunchBeforeArchiveWrite(
 	progress := daemonLaunchProgressWriter{w: os.Stderr}
 	var lastUpdate time.Time
 	for isBackgroundLaunchActive(dataDir) {
+		if backgroundServeProbeHook != nil {
+			backgroundServeProbeHook()
+		}
 		if err := ctx.Err(); err != nil {
 			return true, err
 		}
@@ -407,6 +434,14 @@ func shouldUpgradeIncompatibleDaemonRuntime(
 	return true
 }
 
+// daemonRuntimeAhead reports whether the live daemon speaks a newer API or
+// data version than this client. In that case the daemon is fine and this
+// client is the stale side, so restart guidance must point at the client.
+func daemonRuntimeAhead(rt *DaemonRuntime) bool {
+	return rt != nil &&
+		(rt.API > daemonAPIVersion || rt.Data > db.CurrentDataVersion())
+}
+
 func guardDaemonAutoStartConfig(cfg config.Config) error {
 	host := strings.TrimSpace(cfg.Host)
 	if host == "" || cfg.RequireAuth || isLoopbackHost(host) {
@@ -444,8 +479,8 @@ func transportFromRuntime(rt *DaemonRuntime) transport {
 }
 
 // urlFromDaemonRuntime returns the HTTP URL a CLI client should use
-// to reach the daemon described by rt. Bind-all addresses are
-// mapped to loopback. IPv6 hosts are bracketed via
+// to reach the daemon described by rt, including its base path.
+// Bind-all addresses are mapped to loopback. IPv6 hosts are bracketed via
 // net.JoinHostPort so the URL is well-formed.
 func urlFromDaemonRuntime(rt *DaemonRuntime) string {
 	host := rt.Host
@@ -455,24 +490,39 @@ func urlFromDaemonRuntime(rt *DaemonRuntime) string {
 	case "::":
 		host = "::1"
 	}
-	return "http://" + net.JoinHostPort(host, strconv.Itoa(rt.Port))
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(rt.Port)) + rt.BasePath
+}
+
+func daemonOriginURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.User = nil
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	return strings.TrimSuffix(parsed.String(), "/")
 }
 
 // newService builds the SessionService matching the detected
 // transport. The returned cleanup function must be called when
 // the caller is done with the service.
-func newService(
+func newService(ctx context.Context,
 	cfg config.Config, tr transport,
 ) (service.SessionService, func(), error) {
 	switch tr.Mode {
 	case transportHTTP:
-		return service.NewHTTPBackend(tr.URL, cfg.AuthToken, tr.ReadOnly, tr.BrowserURL),
+		return servicehttp.NewHTTPBackend(tr.URL, cfg.AuthToken, tr.ReadOnly, tr.BrowserURL),
 			func() {}, nil
 	default:
 		if err := directIncompatibleDaemonError(tr); err != nil {
 			return nil, nil, err
 		}
-		d, err := openReadOnlyDB(cfg)
+		d, err := openReadOnlyDB(ctx, cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf(
 				"opening db: %w", err,
@@ -501,14 +551,24 @@ func directIncompatibleDaemonError(tr transport) error {
 	if reason == "" {
 		reason = "local daemon is incompatible with this agentsview client"
 	}
-	return appendDaemonRestartUpgradeHint(errors.New(reason))
+	return appendDaemonCompatibilityHint(tr, errors.New(reason))
+}
+
+// appendDaemonCompatibilityHint picks the guidance that matches which side
+// of the daemon/client pair is stale. A daemon that is ahead of this client
+// must not be restarted; the client needs the newer binary instead.
+func appendDaemonCompatibilityHint(tr transport, err error) error {
+	if tr.DirectDaemonAhead {
+		return fmt.Errorf("%w\n\n%s", err, staleClientUpgradeHint())
+	}
+	return appendDaemonRestartUpgradeHint(err)
 }
 
 // newPGReadService builds a read-only SessionService over the
 // configured PostgreSQL sync store. It shares the same store
 // construction path as pg serve, but leaves schema repair/migration
 // to pg push/serve because CLI read commands never mutate PG. Like
-// pg serve, it runs the PG vector gate so `session search --pg
+// pg serve, it runs the replica vector gate so `session search --pg
 // --semantic|--hybrid` and `mcp --pg` get the same semantic search
 // the SQLite direct path wires via installDirectVectorSearcher.
 func newPGReadService(
@@ -526,6 +586,6 @@ func newPGReadService(
 			priced.SetCustomPricing(cfg.CustomModelPricing)
 		}
 	}
-	wirePGReadVectorSearchFn(cfg, store)
+	wireReplicaReadVectorSearchFn(cfg, pgReplica{}, store)
 	return service.NewReadOnlyBackend(store), cleanup, nil
 }

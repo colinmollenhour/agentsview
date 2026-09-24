@@ -34,6 +34,7 @@ type startupState struct {
 	Host             string    `json:"host,omitempty"`
 	BrowserURL       string    `json:"browser_url,omitempty"`
 	Port             int       `json:"port,omitempty"`
+	ExplicitPort     *int      `json:"explicit_port,omitempty"`
 	RuntimeError     string    `json:"runtime_error,omitempty"`
 	CreateTime       string    `json:"create_time,omitempty"`
 	APIVersion       int       `json:"api_version,omitempty"`
@@ -174,16 +175,26 @@ func (w *startupStateWriter) write() {
 		w.warn(err)
 		return
 	}
-	tmp := w.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		w.warn(err)
-		return
-	}
-	if err := os.Rename(tmp, w.path); err != nil {
+	if err := writeStartupState(filepath.Dir(w.path), data); err != nil {
 		w.warn(err)
 		return
 	}
 	w.lastWrite = w.now()
+}
+
+func writeStartupState(dataDir string, data []byte) error {
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	tmp := startupStateFileName + ".tmp"
+	if err := root.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	defer func() { _ = root.Remove(tmp) }()
+	// Root.Rename can replace a snapshot still open by Windows readers.
+	return root.Rename(tmp, startupStateFileName)
 }
 
 func (w *startupStateWriter) warn(err error) {
@@ -195,7 +206,13 @@ func (w *startupStateWriter) warn(err error) {
 // readStartupState loads the startup snapshot, or nil when the file is
 // missing or unreadable (legacy daemon version, mid-write race).
 func readStartupState(dataDir string) *startupState {
-	data, err := os.ReadFile(startupStatePath(dataDir))
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return nil
+	}
+	defer root.Close()
+	// Root readers share delete access on Windows so snapshots can be replaced.
+	data, err := root.ReadFile(startupStateFileName)
 	if err != nil {
 		return nil
 	}
@@ -211,7 +228,7 @@ func readStartupState(dataDir string) *startupState {
 // lifecycle readers can still report startup progress and require a daemon-
 // authored snapshot before trusting this fallback.
 func publishStartupStateFallback(
-	dataDir, host string, port int, browserURL string, requireAuth, noSync bool, caddyPID int, runtimeErr error,
+	dataDir, host string, port int, browserURL string, requireAuth, noSync bool, explicitPort *int, caddyPID int, runtimeErr error,
 ) {
 	st := readStartupState(dataDir)
 	if st == nil || host == "" || port <= 0 || runtimeErr == nil {
@@ -220,6 +237,7 @@ func publishStartupStateFallback(
 	st.Host = host
 	st.BrowserURL = browserURL
 	st.Port = port
+	st.ExplicitPort = explicitPort
 	st.RuntimeError = runtimeErr.Error()
 	st.RequireAuth = requireAuth
 	st.RequireAuthKnown = true
@@ -242,13 +260,7 @@ func publishStartupStateFallback(
 	if err != nil {
 		return
 	}
-	tmp := startupStatePath(dataDir) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, startupStatePath(dataDir)); err != nil {
-		_ = os.Remove(tmp)
-	}
+	_ = writeStartupState(dataDir, data)
 }
 
 func removeStartupState(dataDir string) {

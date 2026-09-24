@@ -117,6 +117,15 @@
   const refreshStatus = $derived(
     activity.loading ? reportProgressLabel(activity.progress) : undefined,
   );
+  // Every progress label at its widest, so the refresh label box fits them
+  // with the running duration after them.
+  const refreshStatusSamples = [
+    m.activity_loading_report(),
+    m.activity_loading_sessions(),
+    m.activity_loading_usage(),
+    m.activity_report_progress({ count: 9_999_999 }),
+    m.activity_finalizing_report(),
+  ];
 
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   let today = $state(localDateStr(new Date()));
@@ -149,19 +158,41 @@
       count: agent.session_count,
     })),
   ]);
-  const machineOptions = $derived.by((): TypeaheadOption[] => [
-    {
-      name: "",
-      label: m.activity_all_machines(),
-      displayLabel: m.activity_all_machines(),
-    },
-    ...activity.machines.map((machine) => ({
-      name: machine,
-      label: sessions.machineLabel(machine),
-      displayLabel: sessions.machineLabel(machine),
-      meta: sessions.machineLabel(machine) !== machine ? machine : undefined,
-    })),
-  ]);
+  // Machines sharing a friendly label get a short ID fragment so they stay
+  // distinguishable. Full IDs are non-shrinking meta and would squeeze the
+  // label to zero width in the compact menu, so unique labels get no meta.
+  function shortMachineId(machine: string, peers: string[]): string {
+    const head = machine.slice(0, 8);
+    if (peers.every((peer) => peer === machine || peer.slice(0, 8) !== head)) return head;
+    const tail = machine.slice(-8);
+    if (peers.every((peer) => peer === machine || peer.slice(-8) !== tail)) return `…${tail}`;
+    return machine;
+  }
+  const machineOptions = $derived.by((): TypeaheadOption[] => {
+    const byLabel = new Map<string, string[]>();
+    for (const machine of activity.machines) {
+      const label = sessions.machineLabel(machine);
+      byLabel.set(label, [...(byLabel.get(label) ?? []), machine]);
+    }
+    return [
+      {
+        name: "",
+        label: m.activity_all_machines(),
+        displayLabel: m.activity_all_machines(),
+      },
+      ...activity.machines.map((machine) => {
+        const label = sessions.machineLabel(machine);
+        const peers = byLabel.get(label) ?? [];
+        const shortId = peers.length > 1 ? shortMachineId(machine, peers) : undefined;
+        return {
+          name: machine,
+          label,
+          displayLabel: shortId ? `${label} (${shortId})` : label,
+          meta: shortId,
+        };
+      }),
+    ];
+  });
   const automationOptions: TypeaheadOption[] = $derived([
     {
       name: "all",
@@ -414,8 +445,12 @@
     <div class="activity-refresh" aria-live="polite">
       <RefreshControl
         lastUpdatedAt={activity.lastUpdatedAt}
+        queryDurationMs={activity.lastQueryDurationMs}
+        querySteps={activity.lastQuerySteps}
+        liveQuery={activity.liveQuery}
         busy={activity.loading}
         status={refreshStatus}
+        statusWidthSamples={refreshStatusSamples}
         onRefresh={() => activity.load({ background: true })}
         label={m.activity_refresh()}
       />
@@ -515,28 +550,13 @@
     --typeahead-max-width: 150px;
   }
 
+  /* The control reserves its own text widths (see shared/RefreshControl),
+   * so it needs no clamp here: the age box clips a long progress status
+   * instead of pushing the toolbar around. */
   .activity-refresh {
-    flex: 0 0 132px;
-    width: 132px;
+    flex: 0 0 auto;
     max-width: 100%;
     min-width: 0;
-    overflow: hidden;
-  }
-
-  .activity-refresh :global(.kit-refresh-control) {
-    width: 100%;
-    max-width: 100%;
-    min-width: 0;
-  }
-
-  .activity-refresh :global(.kit-refresh-control__status) {
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .activity-refresh :global(.kit-refresh-control__status span) {
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .activity-content {

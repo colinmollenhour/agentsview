@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -25,12 +26,12 @@ func TestWatcherLinkWorkDoesNotScaleWithArchive(t *testing.T) {
 					ID: fmt.Sprintf("archive-%d", i), Agent: "claude",
 					Project: "fixture", Machine: "local", FilePath: &path,
 				}
-				require.NoError(t, database.UpsertSession(session))
+				require.NoError(t, database.UpsertSession(t.Context(), session))
 				if i%2 == 0 {
-					require.NoError(t, database.SoftDeleteSession(session.ID))
+					require.NoError(t, database.SoftDeleteSession(t.Context(), session.ID))
 				}
 			}
-			engine := NewEngine(database, EngineConfig{
+			engine := NewEngine(t.Context(), database, EngineConfig{
 				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
 				Machine:   "local",
 			})
@@ -64,7 +65,7 @@ func TestPollingRetriesFailedLinkWithoutNewSourceChanges(t *testing.T) {
 	root := t.TempDir()
 	writeGroupedClaudeFixture(t, root, "polled-link-retry")
 	seedGroupedSubagentFixture(t, database)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}}, Machine: "local",
 	})
 	t.Cleanup(engine.Close)
@@ -90,11 +91,47 @@ func TestPollingRetriesFailedLinkWithoutNewSourceChanges(t *testing.T) {
 		"a successful retry must let polling return to idle")
 }
 
+func TestPollingRetriesFailedLinkDespiteCachedSourceFailure(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	writeGroupedClaudeFixture(t, root, "polled-link-retry")
+	seedGroupedSubagentFixture(t, database)
+	geminiRoot := t.TempDir()
+	broken := filepath.Join(geminiRoot, "tmp", "project", "chats", "session-broken.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(broken), 0o700))
+	require.NoError(t, os.WriteFile(broken, []byte(`{"messages": invalid}`), 0o600))
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {root}, parser.AgentGemini: {geminiRoot},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+	raw, err := sql.Open("sqlite3", database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec(`CREATE TRIGGER fail_polled_link
+		BEFORE UPDATE OF parent_session_id ON sessions
+		WHEN NEW.id = 'grouped-child'
+		BEGIN SELECT RAISE(FAIL, 'injected poll link failure'); END`)
+	require.NoError(t, err)
+	groups := []ProviderRootsGroup{
+		{Agent: parser.AgentClaude, Roots: []string{root}},
+		{Agent: parser.AgentGemini, Roots: []string{geminiRoot}},
+	}
+	require.Error(t, engine.ReconcileProviderRootsGrouped(t.Context(), groups))
+	requireGroupedChildParent(t, database, false, "the failed link must remain pending")
+	_, err = raw.Exec(`DROP TRIGGER fail_polled_link`)
+	require.NoError(t, err)
+	require.NoError(t, engine.ReconcileProviderRootsGrouped(t.Context(), groups))
+	requireGroupedChildParent(t, database, true, "a cached source failure must not block the pending link")
+}
+
 func TestUnchangedPollingSkipsGlobalLinking(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
 	writeGroupedClaudeFixture(t, root, "polled")
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
 		Machine:   "local",
 	})

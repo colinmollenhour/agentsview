@@ -114,7 +114,7 @@ func TestOpenCodeReviewCacheWrites(t *testing.T) {
 	result := openCodeReviewParseForTest(t, path)
 	require.Len(t, result.Messages, 1)
 	assert.Equal(t, 130, result.Messages[0].ContextTokens)
-	assert.JSONEq(t, `{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":80,"cache_creation_input_tokens":30}`, string(result.Messages[0].TokenUsage))
+	assert.Equal(t, `{"cache_creation_input_tokens":30,"cache_read_input_tokens":80,"input_tokens":20,"output_tokens":5}`, string(result.Messages[0].TokenUsage))
 }
 
 func TestOpenCodeReviewCompressionAndAuxiliaryPrompts(t *testing.T) {
@@ -372,6 +372,7 @@ func openCodeReviewFixtureBytes(t *testing.T) []byte {
 
 func openCodeReviewParseForTest(t *testing.T, path string) ParseResult {
 	t.Helper()
+
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	parsed, err := parseOpenCodeReviewFile(t.Context(), path, "project", "local", SourceFingerprint{Size: info.Size(), MTimeNS: info.ModTime().UnixNano()})
@@ -414,7 +415,7 @@ func findOpenCodeReviewToolCall(t *testing.T, messages []ParsedMessage, name, pa
 			}
 		}
 	}
-	t.Fatalf("tool call %s for %s not found", name, path)
+	require.FailNowf(t, "test failed", "tool call %s for %s not found", name, path)
 	return ParsedToolCall{}
 }
 
@@ -427,7 +428,7 @@ func findOpenCodeReviewToolCallByID(t *testing.T, messages []ParsedMessage, id s
 			}
 		}
 	}
-	t.Fatalf("tool call %s not found", id)
+	require.FailNowf(t, "test failed", "tool call %s not found", id)
 	return ParsedToolCall{}
 }
 

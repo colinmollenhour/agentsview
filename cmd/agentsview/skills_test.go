@@ -36,6 +36,18 @@ func claudeSkillPath(home string) string {
 	return filepath.Join(skills.TargetDir(skills.HarnessClaude, home), skillFileName)
 }
 
+func claudeSearchAgentPath(home string) string {
+	return filepath.Join(home, ".claude", "agents", "agentsview-search-conversations.md")
+}
+
+func claudeLicensePath(home string) string {
+	return filepath.Join(skills.TargetDir(skills.HarnessClaude, home), "LICENSE")
+}
+
+func agentsLicensePath(home string) string {
+	return filepath.Join(skills.TargetDir(skills.HarnessAgents, home), "LICENSE")
+}
+
 // agentsSkillPath returns the SKILL.md path the CLI installs for the Agents
 // harness under home.
 func agentsSkillPath(home string) string {
@@ -100,6 +112,7 @@ func TestSkillsInstall_StatesAndForce(t *testing.T) {
 		{
 			name: "current",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, freshClaudeSkill(t).Content)
 			},
 			wantMsgNoForce: "up to date",
@@ -107,6 +120,7 @@ func TestSkillsInstall_StatesAndForce(t *testing.T) {
 		{
 			name: "stale",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, staleClaudeContent())
 			},
 			wantMsgNoForce: "updated",
@@ -114,6 +128,7 @@ func TestSkillsInstall_StatesAndForce(t *testing.T) {
 		{
 			name: "modified",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, modifiedClaudeContent(t))
 			},
 			wantMsgNoForce: refusalMsg,
@@ -122,6 +137,7 @@ func TestSkillsInstall_StatesAndForce(t *testing.T) {
 		{
 			name: "foreign",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, foreignClaudeContent)
 			},
 			wantMsgNoForce: refusalMsg,
@@ -191,6 +207,58 @@ func TestSkillsInstall_DefaultHarnessesInstallBoth(t *testing.T) {
 	assert.Contains(t, out, agentsSkillPath(home))
 	assert.FileExists(t, claudeSkillPath(home))
 	assert.FileExists(t, agentsSkillPath(home))
+	assert.FileExists(t, claudeLicensePath(home))
+	assert.FileExists(t, agentsLicensePath(home))
+}
+
+func TestSkillsInstall_ClaudeInstallsRecallPackage(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	out, err := executeCommand(newRootCommand(),
+		"skills", "install", "--harness", "claude")
+	require.NoError(t, err, "output: %s", out)
+	assert.FileExists(t, claudeSkillPath(home))
+	assert.FileExists(t, claudeLicensePath(home))
+	assert.FileExists(t, claudeSearchAgentPath(home))
+	assert.Contains(t, out, claudeLicensePath(home))
+	assert.Contains(t, out, claudeSearchAgentPath(home))
+	assert.Contains(t, readFileString(t, claudeLicensePath(home)),
+		"Copyright (c) 2025 Jesse Vincent")
+	assert.NotContains(t, readFileString(t, claudeSkillPath(home)),
+		"Copyright (c) 2025 Jesse Vincent")
+	assert.NotContains(t, readFileString(t, claudeSearchAgentPath(home)),
+		"Copyright (c) 2025 Jesse Vincent")
+}
+
+func TestSkillsInstall_RefusedAgentStillInstallsSkill(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	writeSkillFile(t, claudeSearchAgentPath(home), "human-owned agent\n")
+
+	out, err := executeCommand(newRootCommand(),
+		"skills", "install", "--harness", "claude")
+	require.Error(t, err)
+	assert.FileExists(t, claudeSkillPath(home))
+	assert.Equal(t, "human-owned agent\n",
+		readFileString(t, claudeSearchAgentPath(home)))
+	assert.Contains(t, out, "was modified (or not generated)")
+}
+
+func TestSkillsInstall_ReinstallKeepsRemoteAcrossPackage(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	_, err := executeCommand(newRootCommand(), "skills", "install",
+		"--harness", "claude", "--server", "https://example.invalid")
+	require.NoError(t, err)
+
+	_, err = executeCommand(newRootCommand(),
+		"skills", "install", "--harness", "claude")
+	require.NoError(t, err)
+	assert.Contains(t, readFileString(t, claudeSkillPath(home)),
+		"--server https://example.invalid")
+	assert.NotContains(t, readFileString(t, claudeSearchAgentPath(home)),
+		"https://example.invalid")
 }
 
 func TestSkillsInstall_UnknownHarnessErrors(t *testing.T) {
@@ -245,6 +313,7 @@ func TestSkillsList_ReportsEachState(t *testing.T) {
 		{
 			name: "current",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, freshClaudeSkill(t).Content)
 			},
 			want: "current",
@@ -252,6 +321,7 @@ func TestSkillsList_ReportsEachState(t *testing.T) {
 		{
 			name: "stale",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, staleClaudeContent())
 			},
 			want: "stale",
@@ -259,6 +329,7 @@ func TestSkillsList_ReportsEachState(t *testing.T) {
 		{
 			name: "modified",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, modifiedClaudeContent(t))
 			},
 			want: "modified",
@@ -266,6 +337,7 @@ func TestSkillsList_ReportsEachState(t *testing.T) {
 		{
 			name: "foreign",
 			seed: func(t *testing.T, path string) {
+				t.Helper()
 				writeSkillFile(t, path, foreignClaudeContent)
 			},
 			want: "foreign",
@@ -289,7 +361,7 @@ func TestSkillsList_ReportsEachState(t *testing.T) {
 
 			var claudeRow *skillListRow
 			for i := range rows {
-				if rows[i].Harness == string(skills.HarnessClaude) {
+				if rows[i].Harness == string(skills.HarnessClaude) && rows[i].Artifact == "skill" {
 					claudeRow = &rows[i]
 				}
 			}
@@ -309,13 +381,50 @@ func TestSkillsList_HumanTableHasHeaderAndColumns(t *testing.T) {
 	require.NoError(t, err, "output: %s", out)
 
 	assert.Contains(t, out, "HARNESS")
+	assert.Contains(t, out, "ARTIFACT")
 	assert.Contains(t, out, "LEVEL")
 	assert.Contains(t, out, "STATE")
 	assert.Contains(t, out, "PATH")
 	assert.Contains(t, out, "claude")
 	assert.Contains(t, out, "agents")
+	assert.Contains(t, out, "license")
 	assert.Contains(t, out, "missing")
 	assert.Contains(t, out, claudeSkillPath(home))
+	assert.Contains(t, out, claudeLicensePath(home))
+	assert.Contains(t, out, claudeSearchAgentPath(home))
+}
+
+func TestSkillsList_ReportsPackageArtifacts(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	_, err := executeCommand(newRootCommand(),
+		"skills", "install", "--harness", "claude")
+	require.NoError(t, err)
+	writeSkillFile(t, claudeSearchAgentPath(home),
+		readFileString(t, claudeSearchAgentPath(home))+"\nlocal edit\n")
+
+	out, err := executeCommand(newRootCommand(), "skills", "list", "--format", "json")
+	require.NoError(t, err, "output: %s", out)
+
+	var rows []skillListRow
+	require.NoError(t, json.Unmarshal([]byte(out), &rows), "output: %s", out)
+	states := make(map[string]string)
+	paths := make(map[string]string)
+	for _, row := range rows {
+		if row.Harness == string(skills.HarnessClaude) {
+			states[row.Artifact] = row.State
+			paths[row.Artifact] = row.Path
+		}
+	}
+	assert.Equal(t, map[string]string{
+		"skill":        "current",
+		"license":      "current",
+		"search-agent": "modified",
+	}, states)
+	assert.Equal(t, claudeSkillPath(home), paths["skill"])
+	assert.Equal(t, claudeLicensePath(home), paths["license"])
+	assert.Equal(t, claudeSearchAgentPath(home), paths["search-agent"])
 }
 
 // initTestGitRepo runs `git init` in a fresh temp directory. No commit is
@@ -323,7 +432,7 @@ func TestSkillsList_HumanTableHasHeaderAndColumns(t *testing.T) {
 func initTestGitRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()
-	cmd := exec.Command("git", "init", "-q", "-b", "main")
+	cmd := exec.CommandContext(t.Context(), "git", "init", "-q", "-b", "main")
 	cmd.Dir = repo
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "git init: %s", out)

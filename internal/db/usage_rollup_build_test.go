@@ -91,16 +91,20 @@ func TestClassifyUsageRollupFactsKeepsIrreducibleGroups(t *testing.T) {
 		cross      usageDedupIdentitySet
 		exceptions int
 	}{
-		{"cross-session snapshot identity",
+		{
+			"cross-session snapshot identity",
 			[]usageRollupFact{rollupSnapshotFact(1, 0, "session-a", "2026-08-01", "model-a", 10)},
-			crossSnapshot, 1},
+			crossSnapshot, 1,
+		},
 		{"snapshot group spanning days", []usageRollupFact{
 			rollupSnapshotFact(1, 0, "session-a", "2026-08-01", "model-a", 10),
 			rollupSnapshotFact(1, 1, "session-a", "2026-08-02", "model-a", 20),
 		}, newUsageDedupIdentitySet(), 2},
-		{"cross-session source identity",
+		{
+			"cross-session source identity",
 			[]usageRollupFact{sourceFact(1, 0, "2026-08-01", "model-a")},
-			crossSource, 1},
+			crossSource, 1,
+		},
 		{"general group spanning models", []usageRollupFact{
 			rollupGeneralFact(1, 0, "session-a", "2026-08-01", "model-a", "shared", 10),
 			rollupGeneralFact(1, 1, "session-a", "2026-08-01", "model-b", "shared", 20),
@@ -109,11 +113,16 @@ func TestClassifyUsageRollupFactsKeepsIrreducibleGroups(t *testing.T) {
 			rollupGeneralFact(1, 0, "session-a", "2026-08-01", "model-a", "shared", 10),
 			rollupGeneralFact(1, 1, "session-a", "2026-08-02", "model-a", "shared", 20),
 		}, newUsageDedupIdentitySet(), 2},
-		{"cross usage key",
+		{
+			"cross usage key",
 			[]usageRollupFact{rollupGeneralFact(1, 0, "session-a", "2026-08-01", "model-a", "shared-key", 10)},
-			crossUsage, 1},
-		{"authoritative copilot cost",
-			[]usageRollupFact{copilot}, newUsageDedupIdentitySet(), 1},
+			crossUsage, 1,
+		},
+		{
+			"authoritative copilot cost",
+			[]usageRollupFact{copilot},
+			newUsageDedupIdentitySet(), 1,
+		},
 		{"general group with mixed empty dates", []usageRollupFact{
 			undated,
 			rollupGeneralFact(1, 1, "session-a", "2026-08-01", "model-a", "shared", 20),
@@ -253,6 +262,34 @@ func TestPriceUsageFactPreservesReportedAndAuthoritativeCosts(t *testing.T) {
 	require.NotNil(t, authoritative.AuthoritativeCost)
 	assert.Equal(t, int64(77), authoritative.AuthoritativeCost.Microdollars)
 	assert.Equal(t, 1, authoritative.ComputedAggregate)
+}
+
+func TestPriceUsageFactRateHashFollowsChargedRates(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "model-a",
+		Rates:        export.ModelRates{OutputPerMTok: money.Money{Microdollars: 1_000_000}},
+	}})
+	reported := int64(77)
+	rateHash := func(providerID string, reportedCost *int64) string {
+		t.Helper()
+		priced, err := priceUsageFact(usagePriceInput{
+			ProviderID: providerID, ReportedModel: "model-a",
+			Fact: usagefacts.Fact{
+				Model: "model-a", OutputTokens: 1_000,
+				ReportedCostMicrodollars: reportedCost,
+				CostSource:               "provider-reported",
+			},
+		}, resolver)
+		require.NoError(t, err)
+		return priced.rateHash()
+	}
+
+	assert.Equal(t, rateHash("", nil), rateHash("", &reported),
+		"unadjusted provider charges both rows at catalog rates")
+	assert.NotEqual(t, rateHash("positai", nil), rateHash("positai", &reported),
+		"computed row is charged at billed rates, reported row is not")
+	assert.Equal(t, rateHash("", &reported), rateHash("positai", &reported),
+		"reported rows ignore provider billing adjustments")
 }
 
 func TestPriceUsageFactUsesBilledRatesForReportedCacheSavings(t *testing.T) {

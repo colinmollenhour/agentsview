@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.yaml.in/yaml/v3"
 )
 
 func executeCommand(root *cobra.Command, args ...string) (string, error) {
@@ -171,18 +172,31 @@ func TestOpenAPICommandEmitsSpec(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/sessions/{id}/rename"], "patch")
 }
 
+func TestOpenAPICommandEmitsYAML(t *testing.T) {
+	out, err := executeCommand(newRootCommand(), "openapi", "--yaml")
+	require.NoError(t, err)
+	var spec struct {
+		OpenAPI string                    `yaml:"openapi"`
+		Paths   map[string]map[string]any `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(out), &spec))
+	assert.Equal(t, "3.1.0", spec.OpenAPI)
+	require.Contains(t, spec.Paths, "/api/v1/sessions")
+	assert.Contains(t, spec.Paths["/api/v1/sessions"], "get")
+}
+
 func TestServeCheckDataVersionRejectsNewerDatabase(t *testing.T) {
 	dataDir := testDataDir(t)
 	dbPath := filepath.Join(dataDir, "sessions.db")
 
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err, "open db")
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
-	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")
 	require.NoError(t, conn.Close(), "close raw sqlite")
 

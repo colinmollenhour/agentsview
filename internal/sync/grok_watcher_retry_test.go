@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,29 @@ import (
 
 const grokRetryID = "11111111-2222-4333-8444-555555555555"
 const grokRetrySummary = `{"info":{"id":"11111111-2222-4333-8444-555555555555","cwd":"/workspace/fixture"},"created_at":"2026-07-02T15:11:00Z","updated_at":"2026-07-02T15:12:00Z"}`
+
+type failureFingerprintFactory struct {
+	parser.ProviderFactory
+	calls *atomic.Int32
+}
+
+func (f failureFingerprintFactory) NewProvider(cfg parser.ProviderConfig) parser.Provider {
+	return failureFingerprintProvider{Provider: f.ProviderFactory.NewProvider(cfg), calls: f.calls}
+}
+
+type failureFingerprintProvider struct {
+	parser.Provider
+	calls *atomic.Int32
+}
+
+func (p failureFingerprintProvider) WatchRoots(ctx context.Context) ([]parser.WatchRoot, error) {
+	return parser.ResolveWatchRoots(ctx, p.Provider)
+}
+
+func (p failureFingerprintProvider) Fingerprint(ctx context.Context, source parser.SourceRef) (parser.SourceFingerprint, error) {
+	p.calls.Add(1)
+	return p.Provider.Fingerprint(ctx, source)
+}
 
 func TestGrokWatcherMissingSummaryDoesNotRepeatFingerprint(t *testing.T) {
 	for _, companion := range []string{"signals.json", "chat_history.jsonl", "updates.jsonl", "prompt_context.json"} {
@@ -38,23 +62,28 @@ func TestGrokWatcherMissingSummaryDoesNotRepeatFingerprint(t *testing.T) {
 				var calls atomic.Int32
 				database := openTestDB(t)
 				summary := filepath.Join(dir, "summary.json")
-				require.NoError(t, database.UpsertSession(db.Session{
+				require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 					ID: "grok:" + grokRetryID, Agent: "grok", Project: "fixture",
 					Machine: "local", FilePath: &summary, MessageCount: 1,
 				}))
-				require.NoError(t, database.InsertMessages([]db.Message{{
+				require.NoError(t, database.SetSessionDataVersion(
+					t.Context(), "grok:"+grokRetryID, db.CurrentDataVersion(),
+				))
+				require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
 					SessionID: "grok:" + grokRetryID, Ordinal: 0, Role: "user", Content: "archived prompt",
 				}}))
-				engine := NewEngine(database, EngineConfig{
+				engine := NewEngine(t.Context(), database, EngineConfig{
 					AgentDirs: map[parser.AgentType][]string{parser.AgentGrok: {root}}, Machine: "local",
 					ProviderFactories: []parser.ProviderFactory{failureFingerprintFactory{factory, &calls}},
 				})
 				t.Cleanup(engine.Close)
-				for range 3 {
+				for i := range 3 {
 					err := engine.SyncPathsContext(t.Context(), []string{path})
-					if removed {
+					if removed && i == 0 {
 						require.Error(t, err)
 						assert.Equal(t, 1, engine.LastSyncStats().Failed)
+					} else if removed {
+						require.NoError(t, err, "the failure cache skips an unchanged missing summary")
 					} else {
 						require.NoError(t, err, "writes without a discoverable summary remain unclassified")
 					}
@@ -107,7 +136,7 @@ func TestGrokWatcherCompanionChangesStillRefreshSession(t *testing.T) {
 	}
 	writeContext(`{"is_non_interactive":false}`)
 	database := openTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentGrok: {root}}, Machine: "local",
 	})
 	t.Cleanup(engine.Close)
@@ -155,11 +184,11 @@ func TestGrokWatcherFailureWorkIsIndependentOfArchiveSize(t *testing.T) {
 			for i := range count {
 				path := filepath.Join(root, "archive", fmt.Sprintf("%d.jsonl", i))
 				id := fmt.Sprintf("archived-%d", i)
-				require.NoError(t, database.UpsertSession(db.Session{
+				require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 					ID: id, Agent: "claude", Project: "fixture", Machine: "local", FilePath: &path,
 				}))
 				if i%2 == 0 {
-					require.NoError(t, database.SoftDeleteSession(id))
+					require.NoError(t, database.SoftDeleteSession(t.Context(), id))
 				}
 			}
 			grokRoot := filepath.Join(root, "grok")
@@ -173,14 +202,15 @@ func TestGrokWatcherFailureWorkIsIndependentOfArchiveSize(t *testing.T) {
 			factory, ok := parser.ProviderFactoryByType(parser.AgentGrok)
 			require.True(t, ok)
 			var calls atomic.Int32
-			engine := NewEngine(database, EngineConfig{
+			engine := NewEngine(t.Context(), database, EngineConfig{
 				AgentDirs: map[parser.AgentType][]string{parser.AgentGrok: {grokRoot}}, Machine: "local",
 				ProviderFactories: []parser.ProviderFactory{failureFingerprintFactory{factory, &calls}},
 			})
 			t.Cleanup(engine.Close)
-			for range 3 {
-				require.Error(t, engine.SyncPathsContext(t.Context(), paths))
-				assert.Equal(t, 33, engine.LastSyncStats().Failed)
+			require.Error(t, engine.SyncPathsContext(t.Context(), paths))
+			assert.Equal(t, 33, engine.LastSyncStats().Failed)
+			for range 2 {
+				require.NoError(t, engine.SyncPathsContext(t.Context(), paths))
 			}
 			assert.Equal(t, int32(33), calls.Load(), "each missing summary is attempted once across repeated batches")
 			plan, err := engine.PlanChangedPathsContext(t.Context(), paths[:1])

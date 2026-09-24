@@ -1,21 +1,24 @@
+import { m } from "../i18n/index.js";
+import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
+import { LiveQuery } from "../utils/liveQuery.svelte.js";
+import type { AutomatedScope } from "../api/types.js";
 import type {
-  AnalyticsSummary,
-  ActivityResponse,
-  ProjectsAnalyticsResponse,
-  HourOfWeekResponse,
-  SessionShapeResponse,
-  VelocityResponse,
-  ToolsAnalyticsResponse,
-  SkillsAnalyticsResponse,
-  SignalsAnalyticsResponse,
-  AutomatedScope,
-} from "../api/types.js";
+  DbAnalyticsSummary as AnalyticsSummary,
+  DbActivityResponse as ActivityResponse,
+  DbProjectsAnalyticsResponse as ProjectsAnalyticsResponse,
+  DbHourOfWeekResponse as HourOfWeekResponse,
+  DbSessionShapeResponse as SessionShapeResponse,
+  DbVelocityResponse as VelocityResponse,
+  DbToolsAnalyticsResponse as ToolsAnalyticsResponse,
+  DbSkillsAnalyticsResponse as SkillsAnalyticsResponse,
+  DbSignalsAnalyticsResponse as SignalsAnalyticsResponse,
+} from "../api/generated/index.js";
 import {
   AnalyticsService,
   type DbHeatmapResponse,
   type DbTopSessionsResponse,
 } from "../api/generated/index";
-import { callGenerated, isAbortError } from "../api/runtime.js";
+import { isAbortError, responseTimingOf } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
@@ -45,6 +48,20 @@ type Panel =
   | "topSessions"
   | "signals";
 type FetchResult = "ok" | "error" | "aborted";
+// Execution order of a full refresh; the step breakdown follows it.
+const PANEL_ORDER = [
+  "summary",
+  "activity",
+  "heatmap",
+  "projects",
+  "hourOfWeek",
+  "sessionShape",
+  "velocity",
+  "tools",
+  "skills",
+  "topSessions",
+  "signals",
+] as const satisfies readonly Panel[];
 
 class AnalyticsStore {
   from: string = $state(rollingRange(ANALYTICS_DEFAULT_WINDOW_DAYS).from);
@@ -83,6 +100,23 @@ class AnalyticsStore {
   topMetric: TopSessionsMetric = $state("messages");
   lastUpdatedAt: number | null = $state(null);
   qualityLastUpdatedAt: number | null = $state(null);
+  // Wall-clock ms of the most recent refresh, request start to data applied,
+  // shown next to each page's refresh label. null until the first load.
+  lastQueryDurationMs: number | null = $state(null);
+  qualityLastQueryDurationMs: number | null = $state(null);
+  // Per-panel timings behind the durations above, in PANEL_ORDER.
+  lastQuerySteps: QueryStep[] = $state([]);
+  qualityLastQuerySteps: QueryStep[] = $state([]);
+  // Latest successful timing per panel, collected while a refresh runs and
+  // snapshotted into lastQuerySteps when the refresh completes. Offsets are
+  // relative to refreshStartedAt.
+  private stepTimings = new Map<Panel, QueryStep>();
+  private refreshStartedAt = 0;
+  // The refresh each page is running now, drawn live by its refresh
+  // control. Panel fetches report into whichever one began last.
+  readonly liveQuery = new LiveQuery();
+  readonly qualityLiveQuery = new LiveQuery();
+  private currentLiveQuery: LiveQuery = this.liveQuery;
   hasNewData: boolean = $state(false);
 
   loading = $state({
@@ -465,12 +499,23 @@ class AnalyticsStore {
     // fresh.
     if (isFirstLoad) this.errors[panel] = null;
     const started = performance.now();
+    const liveQuery = this.currentLiveQuery;
+    const liveStep = liveQuery.start(panel, started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const data = await callGenerated(fetchRequest, signal);
+      const data = await fetchRequest({ signal });
       if (this.versions[panel] === v) {
         onSuccess(data);
         this.errors[panel] = null;
+        const step = queryStepFrom(
+          panel,
+          responseTimingOf(data),
+          started,
+          performance.now(),
+          this.refreshStartedAt,
+        );
+        this.stepTimings.set(panel, step);
+        liveQuery.settle(liveStep, step);
         return "ok";
       }
       return "aborted";
@@ -485,20 +530,22 @@ class AnalyticsStore {
         // existing values stay visible instead of flipping to an
         // error state. First-load failures still surface.
         if (isFirstLoad) {
-          this.errors[panel] = e instanceof Error ? e.message : "Failed to load";
+          this.errors[panel] = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else {
           console.warn(`analytics.${panel} refetch failed:`, e);
         }
       }
       return "error";
     } finally {
+      const durationMs = performance.now() - started;
       perf.recordPanel({
         route: "analytics",
         name: panel,
-        durationMs: performance.now() - started,
+        durationMs,
         status,
       });
       this.clearAbortSignal(panel, signal);
+      liveQuery.abandon(liveStep);
       if (this.versions[panel] === v) {
         this.querying[panel] = false;
         this.loading[panel] = false;
@@ -521,6 +568,8 @@ class AnalyticsStore {
 
   cancelInFlightReads(): void {
     this.fetchAllVersion++;
+    this.liveQuery.end();
+    this.qualityLiveQuery.end();
     for (const panel of Object.keys(this.abortControllers) as Panel[]) {
       this.versions[panel]++;
       this.abortControllers[panel]?.abort();
@@ -530,9 +579,15 @@ class AnalyticsStore {
     }
   }
 
-  private markRefreshComplete(): void {
+  private markRefreshComplete(startedAt: number): void {
     this.lastUpdatedAt = Date.now();
+    this.lastQueryDurationMs = performance.now() - startedAt;
+    this.lastQuerySteps = this.snapshotSteps();
     this.hasNewData = false;
+  }
+
+  private snapshotSteps(): QueryStep[] {
+    return PANEL_ORDER.flatMap((name) => this.stepTimings.get(name) ?? []);
   }
 
   private rollDates(): void {
@@ -544,6 +599,11 @@ class AnalyticsStore {
 
   async fetchAll() {
     this.fetchStartHandler?.();
+    const startedAt = performance.now();
+    this.stepTimings.clear();
+    this.refreshStartedAt = startedAt;
+    this.currentLiveQuery = this.liveQuery;
+    const live = this.liveQuery.begin(startedAt);
     const fetchVersion = ++this.fetchAllVersion;
     this.rollDates();
     const results = await Promise.all([
@@ -560,8 +620,9 @@ class AnalyticsStore {
       this.fetchSignals(),
     ]);
     if (fetchVersion === this.fetchAllVersion && results.every((result) => result === "ok")) {
-      this.markRefreshComplete();
+      this.markRefreshComplete(startedAt);
     }
+    this.liveQuery.end(live);
   }
 
   async fetchSummary(): Promise<FetchResult> {
@@ -770,10 +831,20 @@ class AnalyticsStore {
     // The Quality page has no model control and the model filter is an
     // Analytics-only scope; omit it so a model selected on Analytics does not
     // silently narrow the Quality signal facts.
+    const startedAt = performance.now();
+    this.refreshStartedAt = startedAt;
+    this.currentLiveQuery = this.qualityLiveQuery;
+    const live = this.qualityLiveQuery.begin(startedAt);
     const result = await this.fetchSignals({ includeModel: false });
     if (result === "ok") {
       this.qualityLastUpdatedAt = Date.now();
+      const durationMs = performance.now() - startedAt;
+      this.qualityLastQueryDurationMs = durationMs;
+      this.qualityLastQuerySteps = [
+        this.stepTimings.get("signals") ?? { name: "signals", startMs: 0, durationMs },
+      ];
     }
+    this.qualityLiveQuery.end(live);
   }
 
   setTopMetric(m: TopSessionsMetric) {

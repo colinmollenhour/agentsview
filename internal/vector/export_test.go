@@ -28,7 +28,7 @@ func fakeExportEncoder() kitvec.EncodeFunc {
 // exportTestSource returns a fakeUnitSource with two sessions: session-1
 // holds a user doc plus a multi-message run doc, session-2 holds a single
 // user doc, the small corpus TestExportRoundTrip and
-// TestSessionEmbeddedDocHashesChangesWithContent share.
+// TestSessionDocHashesChangesWithContent share.
 func exportTestSource() *fakeUnitSource {
 	return &fakeUnitSource{rows: []fakeUnit{
 		{
@@ -53,7 +53,7 @@ func exportTestSource() *fakeUnitSource {
 func newBuiltTestIndex(t *testing.T) (*Index, kitvec.Generation) {
 	t.Helper()
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := exportTestSource()
 	gen := fakeGeneration4Dim()
 
@@ -75,25 +75,29 @@ func fakeGeneration4Dim() kitvec.Generation {
 }
 
 func TestExportRoundTrip(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	ix, gen := newBuiltTestIndex(t)
 
 	exp, ok, err := ix.ActiveExport(ctx)
 	require.NoError(t, err)
 	require.True(t, ok)
-	assert.Equal(t, gen.Fingerprint(), exp.Fingerprint)
+	assert.Equal(t, exp.Fingerprint, gen.Fingerprint())
 	assert.Equal(t, 4, exp.Dimension)
 	assert.NotEmpty(t, exp.Model)
 
-	hashes, err := ix.SessionEmbeddedDocHashes(ctx, exp.Ordinal, nil)
+	export, ok, err := ix.BeginExport(ctx, nil)
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer export.Close()
+	hashes, err := export.SessionDocHashes(ctx, nil)
 	require.NoError(t, err)
 	require.Len(t, hashes, 2)
 
-	docs, aggHash, err := ix.ExportSessionDocs(ctx, exp.Ordinal, "session-1")
+	docs, aggHash, err := export.SessionDocs(ctx, "session-1")
 	require.NoError(t, err)
 	require.NotEmpty(t, docs)
 	assert.Equal(t, hashes["session-1"], aggHash,
-		"export hash must equal the session's SessionEmbeddedDocHashes value")
+		"export hash must equal the session's SessionDocHashes value")
 	for _, d := range docs {
 		assert.Equal(t, "session-1", d.SessionID)
 		assert.NotEmpty(t, d.ContentHash)
@@ -103,48 +107,43 @@ func TestExportRoundTrip(t *testing.T) {
 		}
 	}
 
-	noDocs, emptyHash, err := ix.ExportSessionDocs(ctx, exp.Ordinal, "absent")
+	noDocs, emptyHash, err := export.SessionDocs(ctx, "absent")
 	require.NoError(t, err)
 	assert.Empty(t, noDocs)
-	assert.Equal(t, "", emptyHash,
+	assert.Empty(t, emptyHash,
 		"an empty export hashes to \"\", matching absence from the hash map")
 }
 
-func TestSessionEmbeddedDocHashesScoped(t *testing.T) {
-	ctx := context.Background()
+func TestSessionDocHashesScoped(t *testing.T) {
+	ctx := t.Context()
 	ix, _ := newBuiltTestIndex(t)
 
-	exp, ok, err := ix.ActiveExport(ctx)
+	export, ok, err := ix.BeginExport(ctx, nil)
 	require.NoError(t, err)
 	require.True(t, ok)
+	defer export.Close()
 
-	all, err := ix.SessionEmbeddedDocHashes(ctx, exp.Ordinal, nil)
+	all, err := export.SessionDocHashes(ctx, nil)
 	require.NoError(t, err)
 	require.Len(t, all, 2)
 
-	scoped, err := ix.SessionEmbeddedDocHashes(
-		ctx, exp.Ordinal, []string{"session-1"},
-	)
+	scoped, err := export.SessionDocHashes(ctx, []string{"session-1"})
 	require.NoError(t, err)
 	require.Len(t, scoped, 1)
 	assert.Equal(t, all["session-1"], scoped["session-1"],
 		"a scoped read must produce the same aggregate as the full scan")
 
-	empty, err := ix.SessionEmbeddedDocHashes(
-		ctx, exp.Ordinal, []string{},
-	)
+	empty, err := export.SessionDocHashes(ctx, []string{})
 	require.NoError(t, err)
 	assert.Empty(t, empty)
 
-	absent, err := ix.SessionEmbeddedDocHashes(
-		ctx, exp.Ordinal, []string{"absent"},
-	)
+	absent, err := export.SessionDocHashes(ctx, []string{"absent"})
 	require.NoError(t, err)
 	assert.Empty(t, absent)
 }
 
 func TestExportNoActiveGeneration(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	ix := newEmptyTestIndex(t)
 	_, ok, err := ix.ActiveExport(ctx)
 	require.NoError(t, err)
@@ -152,7 +151,7 @@ func TestExportNoActiveGeneration(t *testing.T) {
 }
 
 func TestVectorExportRebuildSnapshotConsistency(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	ix, gen := newBuiltTestIndex(t)
 	src := exportTestSource()
 
@@ -175,7 +174,7 @@ func TestVectorExportRebuildSnapshotConsistency(t *testing.T) {
 
 	_, ok, err = ix.BeginExport(ctx, nil)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrExportNotReady)
+	require.ErrorIs(t, err, ErrExportNotReady)
 	assert.False(t, ok)
 
 	gotHashes, err := old.SessionDocHashes(ctx, nil)
@@ -205,7 +204,7 @@ func TestVectorExportRebuildSnapshotConsistency(t *testing.T) {
 }
 
 func TestVectorExportHandleLifecycle(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	ix, _ := newBuiltTestIndex(t)
 	export, ok, err := ix.BeginExport(ctx, nil)
 	require.NoError(t, err)
@@ -213,40 +212,40 @@ func TestVectorExportHandleLifecycle(t *testing.T) {
 	require.NoError(t, export.Close())
 	require.NoError(t, export.Close())
 	_, err = export.SessionDocHashes(ctx, nil)
-	assert.Error(t, err)
+	require.Error(t, err)
 	_, _, err = export.SessionDocs(ctx, "session-1")
 	assert.Error(t, err)
 }
 
 func TestVectorExportTreatsParkedStampedDocsAsNotReady(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	ix, _ := newBuiltTestIndex(t)
 
 	exp, ok, err := ix.ActiveExport(ctx)
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, err = ix.db.Exec(`
+	_, err = ix.db.ExecContext(ctx, `
 UPDATE vector_messages
    SET ordinal = -1
  WHERE session_id = ? AND content = ?`, "session-1", "hello")
 	require.NoError(t, err)
 
-	missing, err := ix.MissingEmbeddedDocs(ctx, exp.Ordinal, nil)
+	missing, err := ix.MissingEmbeddedDocs(ctx, exp.Fingerprint, nil)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, missing)
 
-	scopedMissing, err := ix.MissingEmbeddedDocs(ctx, exp.Ordinal, []string{"session-1"})
+	scopedMissing, err := ix.MissingEmbeddedDocs(ctx, exp.Fingerprint, []string{"session-1"})
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, scopedMissing)
 
-	otherMissing, err := ix.MissingEmbeddedDocs(ctx, exp.Ordinal, []string{"session-2"})
+	otherMissing, err := ix.MissingEmbeddedDocs(ctx, exp.Fingerprint, []string{"session-2"})
 	require.NoError(t, err)
 	assert.Zero(t, otherMissing)
 
 	_, ok, err = ix.BeginExport(ctx, nil)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrExportNotReady)
+	require.ErrorIs(t, err, ErrExportNotReady)
 	assert.False(t, ok)
 
 	scoped, ok, err := ix.BeginExport(ctx, []string{"session-2"})
@@ -255,15 +254,15 @@ UPDATE vector_messages
 	require.NoError(t, scoped.Close())
 }
 
-// TestSessionEmbeddedDocHashesChangesWithContent builds, captures each
+// TestSessionDocHashesChangesWithContent builds, captures each
 // session's embedded-doc aggregate hash, mutates session-1's user doc
 // content in the fake source and refreshes (without rebuilding), then
 // captures again: session-1's stamp no longer matches its new content_hash,
 // so it drops out of the aggregate (session-1's run doc, a1, is untouched
 // and stays embedded, so the session key survives with a changed hash);
 // session-2, untouched, keeps a stable hash.
-func TestSessionEmbeddedDocHashesChangesWithContent(t *testing.T) {
-	ctx := context.Background()
+func TestSessionDocHashesChangesWithContent(t *testing.T) {
+	ctx := t.Context()
 	ix := openTestIndex(t)
 	src := exportTestSource()
 	gen := fakeGeneration4Dim()
@@ -271,12 +270,7 @@ func TestSessionEmbeddedDocHashesChangesWithContent(t *testing.T) {
 	_, err := ix.Build(ctx, src, fakeExportEncoder(), gen, BuildOptions{})
 	require.NoError(t, err)
 
-	exp, ok, err := ix.ActiveExport(ctx)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	before, err := ix.SessionEmbeddedDocHashes(ctx, exp.Ordinal, nil)
-	require.NoError(t, err)
+	before := sessionDocHashes(t, ix)
 	require.Contains(t, before, "session-1")
 	require.Contains(t, before, "session-2")
 
@@ -287,8 +281,7 @@ func TestSessionEmbeddedDocHashesChangesWithContent(t *testing.T) {
 	_, err = ix.Refresh(ctx, src, false, true)
 	require.NoError(t, err)
 
-	after, err := ix.SessionEmbeddedDocHashes(ctx, exp.Ordinal, nil)
-	require.NoError(t, err)
+	after := sessionDocHashes(t, ix)
 	require.Contains(t, after, "session-1",
 		"session-1's untouched run doc keeps it in the aggregate")
 	assert.NotEqual(t, before["session-1"], after["session-1"],
@@ -296,10 +289,15 @@ func TestSessionEmbeddedDocHashesChangesWithContent(t *testing.T) {
 	assert.Equal(t, before["session-2"], after["session-2"],
 		"the untouched session's hash is stable")
 
-	// The export hash follows the shrunken embedded subset, so a pg push whose
-	// delta scan read `before` sees the divergence and defers the session
-	// instead of exporting the partial view.
-	_, exportHash, err := ix.ExportSessionDocs(ctx, exp.Ordinal, "session-1")
+	// The export hash follows the shrunken embedded subset, so a replica push
+	// whose delta scan read `before` sees the divergence and defers the
+	// session instead of exporting the partial view. The scoped export is
+	// ready because session-2 is fully covered.
+	export, ok, err := ix.BeginExport(ctx, []string{"session-2"})
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer export.Close()
+	_, exportHash, err := export.SessionDocs(ctx, "session-1")
 	require.NoError(t, err)
 	assert.Equal(t, after["session-1"], exportHash,
 		"export hash tracks the current embedded subset")
@@ -307,14 +305,14 @@ func TestSessionEmbeddedDocHashesChangesWithContent(t *testing.T) {
 		"a stale delta-scan hash no longer matches the export")
 }
 
-// TestSessionEmbeddedDocHashesChangesWithMetadata guards the compaction/resync
+// TestSessionDocHashesChangesWithMetadata guards the compaction/resync
 // case: a doc whose content (and content_hash) is unchanged but whose ordinal
 // shifts keeps its UUID-derived doc_key and its embedding stamp, so it stays
 // embedded — yet the aggregate must still change so pg push re-anchors it. A
 // hash over only (doc_key, content_hash) would miss this and leave PG anchors
 // stale. session-2, untouched, keeps a stable hash.
-func TestSessionEmbeddedDocHashesChangesWithMetadata(t *testing.T) {
-	ctx := context.Background()
+func TestSessionDocHashesChangesWithMetadata(t *testing.T) {
+	ctx := t.Context()
 	ix := openTestIndex(t)
 	src := exportTestSource()
 	gen := fakeGeneration4Dim()
@@ -322,12 +320,7 @@ func TestSessionEmbeddedDocHashesChangesWithMetadata(t *testing.T) {
 	_, err := ix.Build(ctx, src, fakeExportEncoder(), gen, BuildOptions{})
 	require.NoError(t, err)
 
-	exp, ok, err := ix.ActiveExport(ctx)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	before, err := ix.SessionEmbeddedDocHashes(ctx, exp.Ordinal, nil)
-	require.NoError(t, err)
+	before := sessionDocHashes(t, ix)
 	require.Contains(t, before, "session-1")
 	require.Contains(t, before, "session-2")
 
@@ -342,8 +335,7 @@ func TestSessionEmbeddedDocHashesChangesWithMetadata(t *testing.T) {
 	_, err = ix.Refresh(ctx, src, false, true)
 	require.NoError(t, err)
 
-	after, err := ix.SessionEmbeddedDocHashes(ctx, exp.Ordinal, nil)
-	require.NoError(t, err)
+	after := sessionDocHashes(t, ix)
 	require.Contains(t, after, "session-1",
 		"a pure ordinal shift keeps the doc embedded (content_hash unchanged)")
 	assert.NotEqual(t, before["session-1"], after["session-1"],
@@ -354,12 +346,12 @@ func TestSessionEmbeddedDocHashesChangesWithMetadata(t *testing.T) {
 
 // TestExportVersionMismatchReturnsSentinel covers the read-path version gate on
 // the export API: a read-only Index over a mirror stamped with a different
-// MirrorSchemaVersion must refuse ActiveExport, SessionEmbeddedDocHashes, and
-// ExportSessionDocs with ErrMirrorVersionMismatch, the same fail-closed
+// MirrorSchemaVersion must refuse ActiveExport, BeginExport, and
+// MissingEmbeddedDocs with ErrMirrorVersionMismatch, the same fail-closed
 // behavior Search and StaleActive apply, instead of exporting rows shaped by a
 // different schema.
 func TestExportVersionMismatchReturnsSentinel(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	seedV2Mirror(t, path)
 
@@ -368,11 +360,29 @@ func TestExportVersionMismatchReturnsSentinel(t *testing.T) {
 	defer ro.Close()
 
 	_, _, err = ro.ActiveExport(ctx)
-	assert.ErrorIs(t, err, ErrMirrorVersionMismatch)
+	require.ErrorIs(t, err, ErrMirrorVersionMismatch)
 
-	_, err = ro.SessionEmbeddedDocHashes(ctx, 1, nil)
-	assert.ErrorIs(t, err, ErrMirrorVersionMismatch)
+	_, _, err = ro.BeginExport(ctx, nil)
+	require.ErrorIs(t, err, ErrMirrorVersionMismatch)
 
-	_, _, err = ro.ExportSessionDocs(ctx, 1, "s1")
+	_, err = ro.MissingEmbeddedDocs(ctx, "fp", nil)
 	assert.ErrorIs(t, err, ErrMirrorVersionMismatch)
+}
+
+// sessionDocHashes opens a generation-wide export when the index is ready,
+// or a session-2-scoped one when session-1 has pending docs, and returns the
+// per-session aggregates for every embedded session.
+func sessionDocHashes(t *testing.T, ix *Index) map[string]string {
+	t.Helper()
+	ctx := t.Context()
+	export, ok, err := ix.BeginExport(ctx, nil)
+	if errors.Is(err, ErrExportNotReady) {
+		export, ok, err = ix.BeginExport(ctx, []string{"session-2"})
+	}
+	require.NoError(t, err)
+	require.True(t, ok)
+	defer export.Close()
+	hashes, err := export.SessionDocHashes(ctx, nil)
+	require.NoError(t, err)
+	return hashes
 }

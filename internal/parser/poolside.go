@@ -14,6 +14,7 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 const poolsideIDPrefix = "poolside:"
@@ -543,7 +545,7 @@ func parsePoolsideSession(
 	for _, msg := range messages {
 		if msg.Role == RoleUser && !msg.IsSystem &&
 			strings.TrimSpace(msg.Content) != "" {
-			firstMsg = truncateFirstMessage(msg.Content)
+			firstMsg = stringutil.TruncateRunes(msg.Content, 300, "")
 			break
 		}
 	}
@@ -690,5 +692,5 @@ func hashPoolsideSourceFile(path string) (string, int64, int64, error) {
 		return "", 0, 0, err
 	}
 
-	return fmt.Sprintf("%x", h.Sum(nil)), size, mtime, nil
+	return hex.EncodeToString(h.Sum(nil)), size, mtime, nil
 }

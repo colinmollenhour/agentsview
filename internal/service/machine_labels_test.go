@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 )
 
 type machineLabelsStore struct {
@@ -32,7 +33,7 @@ func TestMachineLabelsFromStoreBackend(t *testing.T) {
 	}
 
 	got, err := service.MachineLabels(
-		context.Background(), service.NewReadOnlyBackend(store),
+		t.Context(), service.NewReadOnlyBackend(store),
 	)
 
 	require.NoError(t, err)
@@ -50,12 +51,12 @@ func TestMachineLabelsFromHTTPBackend(t *testing.T) {
 		_, err := io.WriteString(w,
 			`{"machines":["machine-key"],"machine_labels":{"machine-key":"Build Host"},"machine_aliases":{"local":"machine-key"}}`,
 		)
-		require.NoError(t, err)
+		assert.NoError(t, err)
 	}))
 	t.Cleanup(server.Close)
 
 	got, err := service.MachineLabels(
-		context.Background(), service.NewHTTPBackend(server.URL, "", true, ""),
+		t.Context(), servicehttp.NewHTTPBackend(server.URL, "", true, ""),
 	)
 
 	require.NoError(t, err)
@@ -66,7 +67,7 @@ func TestMachineLabelsFromHTTPBackend(t *testing.T) {
 func TestMachineLabelsUnsupportedServiceReturnsNil(t *testing.T) {
 	var svc unsupportedMachineLabelsService
 
-	got, err := service.MachineLabels(context.Background(), svc)
+	got, err := service.MachineLabels(t.Context(), svc)
 
 	require.NoError(t, err)
 	assert.Nil(t, got)

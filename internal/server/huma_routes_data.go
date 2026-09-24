@@ -9,10 +9,13 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerDataRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/data", "Data")
+	group := huma.NewGroup(s.api, "/api/v1/data")
+	configureRouteGroup(group, "Data")
 	s.get(group, "/projects", "Get project inventory", s.humaDataProjects)
 	s.get(group, "/projects/{project_key}/sessions",
 		"List sessions for an opaque project identity", s.humaDataProjectSessions)
@@ -247,7 +250,7 @@ func (s *Server) humaDataCompact(
 	if s.localCompactRunner != nil {
 		result, err = s.localCompactRunner(ctx, options)
 	} else {
-		err = s.tryArchiveWrite(func() error {
+		err = s.tryArchiveWrite(ctx, func() error {
 			result, err = local.Compact(ctx, options)
 			return err
 		})
@@ -338,7 +341,7 @@ func (s *Server) humaDataStripImages(
 	// StripToolImages documents that the caller owns the archive write lock;
 	// the daemon's foreground exclusive boundary is that ownership, not the
 	// CLI flock, and it refuses rather than queues behind a worker pass.
-	err = s.tryArchiveWrite(func() error {
+	err = s.tryArchiveWrite(ctx, func() error {
 		var stripErr error
 		report, stripErr = local.StripToolImages(ctx, filter)
 		// An error can follow per-session commits, even with an empty report.

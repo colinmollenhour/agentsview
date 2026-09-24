@@ -51,20 +51,21 @@ func (s *Store) searchContentSemanticPG(
 		}
 		score := float64(h.Score)
 		out = append(out, db.ContentMatch{
-			SessionID:       h.SessionID,
-			Project:         info.project,
-			Agent:           info.agent,
-			Location:        "message",
-			Role:            info.role,
-			Ordinal:         h.Ordinal,
-			OrdinalRange:    [2]int{h.OrdinalStart, h.OrdinalEnd},
-			Subordinate:     h.Subordinate,
-			Relationship:    info.relationshipType,
-			ParentSessionID: info.parentSessionID,
-			Sidechain:       info.isSidechain,
-			Timestamp:       info.timestamp,
-			Snippet:         f.SemanticSnippet(info.content, h.Snippet),
-			Score:           &score,
+			SessionID:          h.SessionID,
+			Project:            info.project,
+			Agent:              info.agent,
+			TranscriptRevision: info.transcriptRevision,
+			Location:           "message",
+			Role:               info.role,
+			Ordinal:            h.Ordinal,
+			OrdinalRange:       [2]int{h.OrdinalStart, h.OrdinalEnd},
+			Subordinate:        h.Subordinate,
+			Relationship:       info.relationshipType,
+			ParentSessionID:    info.parentSessionID,
+			Sidechain:          info.isSidechain,
+			Timestamp:          info.timestamp,
+			Snippet:            f.SemanticSnippet(info.content, h.Snippet),
+			Score:              &score,
 		})
 		if len(out) >= f.Limit {
 			break
@@ -116,12 +117,12 @@ func pgUniqueSessionIDs(hits []db.VectorHit) []string {
 }
 
 // semanticPGSessionFilter maps a ContentSearchFilter for the semantic/hybrid
-// session scope: the shared pgSessionFilter mapping plus the child one-shot
+// session scope: the shared db.ContentSessionFilter mapping plus the child one-shot
 // exemption (SessionFilter.ChildExemptOneShot) -- child sessions must not be
 // dropped by the one-shot gate in these modes, while top-level one-shots keep
 // today's exclusion. It mirrors internal/db.semanticContentSessionFilter.
 func semanticPGSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
-	sf := pgSessionFilter(f)
+	sf := db.ContentSessionFilter(f)
 	sf.ChildExemptOneShot = true
 	return sf
 }
@@ -151,6 +152,7 @@ func (s *Store) semanticAllowedSessionIDsPG(
 	if err != nil {
 		return nil, fmt.Errorf("pg semantic search session scope: %w", err)
 	}
+	defer rows.Close()
 	defer func() { _ = rows.Close() }()
 
 	allowed := make(map[string]bool, len(ids))
@@ -176,6 +178,7 @@ func (s *Store) semanticAllowedSessionIDsPG(
 // sessions/messages rows; isSidechain is the ANCHOR ordinal's message flag.
 type pgSemanticHitInfo struct {
 	project, agent, role, timestamp, content string
+	transcriptRevision                       string
 	relationshipType, parentSessionID        string
 	isSidechain                              bool
 }
@@ -204,6 +207,7 @@ func (s *Store) enrichSemanticHitsPG(
 	const query = `
 SELECT m.session_id, s.project, s.agent, m.role, m.ordinal,
        m.timestamp, m.content,
+       COALESCE(s.transcript_revision, ''),
        COALESCE(s.relationship_type, ''), COALESCE(s.parent_session_id, ''),
        m.is_sidechain
   FROM (SELECT unnest($1::text[]) AS session_id,
@@ -215,6 +219,7 @@ SELECT m.session_id, s.project, s.agent, m.role, m.ordinal,
 	if err != nil {
 		return nil, fmt.Errorf("pg semantic search enrich: %w", err)
 	}
+	defer rows.Close()
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
@@ -223,6 +228,7 @@ SELECT m.session_id, s.project, s.agent, m.role, m.ordinal,
 		var ts *time.Time
 		if err := rows.Scan(&ref.SessionID, &info.project, &info.agent,
 			&info.role, &ref.Ordinal, &ts, &info.content,
+			&info.transcriptRevision,
 			&info.relationshipType, &info.parentSessionID,
 			&info.isSidechain); err != nil {
 			return nil, fmt.Errorf("scan pg semantic hit: %w", err)

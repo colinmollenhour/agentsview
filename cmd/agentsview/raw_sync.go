@@ -66,6 +66,7 @@ func newRawSyncCommand() *cobra.Command {
 	}
 	cmd.AddCommand(newRawSyncWatchCommand())
 	cmd.AddCommand(newRawSyncStatusCommand())
+	cmd.AddCommand(newRawSyncCleanUploadsCommand())
 	return cmd
 }
 
@@ -395,7 +396,7 @@ func rawSyncProvidersAndRoots(
 			}
 			if index, found := rootIndex[path]; found {
 				if index < 0 || index >= len(roots) {
-					return nil, nil, fmt.Errorf("raw-sync watch root index is invalid")
+					return nil, nil, errors.New("raw-sync watch root index is invalid")
 				}
 				root := &roots[index]
 				root.Recursive = root.Recursive || planned.Recursive

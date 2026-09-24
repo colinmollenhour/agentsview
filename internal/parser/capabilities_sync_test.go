@@ -22,6 +22,13 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
 		},
+		// Augure Code shares the Codex provider, so it must share its
+		// semantics.
+		AgentAugureCode: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+			SkipCacheFreshWithoutStoredRow:      true,
+		},
 		// TraeX shares the Codex provider, so it must share its semantics.
 		AgentTraeX: {
 			FingerprintHashInCacheKey:           true,
@@ -40,6 +47,11 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
+		// Augure Desktop shares the Hermes provider, so it must share its
+		// semantics.
+		AgentAugureDesktop: {
+			FingerprintHashRequiredForFreshness: true,
+		},
 		AgentHermes: {
 			FingerprintHashRequiredForFreshness: true,
 		},
@@ -51,6 +63,10 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentCrush: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentCodeBuddy: {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
@@ -117,6 +133,12 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentCopilot: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		// Grok companion edits can keep the summary's size and mtime, so
+		// freshness depends on the content fingerprint.
+		AgentGrok: {
+			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
 	}

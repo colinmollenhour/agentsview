@@ -11,10 +11,13 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerSettingsRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/settings", "Settings")
+	group := huma.NewGroup(s.api, "/api/v1/settings")
+	configureRouteGroup(group, "Settings")
 
 	s.get(group, "", "Get settings", s.humaGetSettings)
 	s.put(group, "", "Update settings", s.humaUpdateSettings)
@@ -349,7 +352,7 @@ func (s *Server) humaApplyWorktreeMappings(
 	if in.Body.Machine != nil && strings.TrimSpace(*in.Body.Machine) != "" {
 		machine = strings.TrimSpace(*in.Body.Machine)
 	}
-	result, err := s.syncEngineForLocal(localDB).ApplyWorktreeProjectMappings(ctx, machine)
+	result, err := s.syncEngineForLocal(ctx, localDB).ApplyWorktreeProjectMappings(ctx, machine)
 	if err != nil {
 		return nil, internalError("apply worktree mappings", err)
 	}
@@ -402,7 +405,7 @@ func (s *Server) humaReclassifyWorktreeProject(
 	if err != nil {
 		return nil, humaWorktreeReclassificationError(err)
 	}
-	mapping, result, err := s.syncEngineForLocal(localDB).ApplyWorktreeReclassification(
+	mapping, result, err := s.syncEngineForLocal(ctx, localDB).ApplyWorktreeReclassification(
 		ctx, draft, in.Body.MappingToken, current.ExistingMappingID,
 	)
 	if err != nil {
@@ -421,14 +424,14 @@ func (s *Server) humaAssignSessionProject(
 	if err != nil {
 		return nil, err
 	}
-	assignment, err := s.syncEngineForLocal(localDB).AssignSessionProject(
+	assignment, err := s.syncEngineForLocal(ctx, localDB).AssignSessionProject(
 		ctx, in.SessionID, in.Body.Project,
 	)
 	if err != nil {
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return nil, apiError(http.StatusNotFound, "session not found")
-		case strings.Contains(err.Error(), "required"):
+		case errors.Is(err, db.ErrSessionProjectAssignmentInvalid):
 			return nil, apiError(http.StatusBadRequest, err.Error())
 		default:
 			return nil, internalError("assign session project", err)
@@ -445,14 +448,14 @@ func (s *Server) humaClearSessionProjectAssignment(
 	if err != nil {
 		return nil, err
 	}
-	cleared, err := s.syncEngineForLocal(localDB).ClearSessionProjectAssignment(
+	cleared, err := s.syncEngineForLocal(ctx, localDB).ClearSessionProjectAssignment(
 		ctx, in.SessionID,
 	)
 	if err != nil {
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			return nil, apiError(http.StatusNotFound, "session assignment not found")
-		case strings.Contains(err.Error(), "required"):
+		case errors.Is(err, db.ErrSessionProjectAssignmentInvalid):
 			return nil, apiError(http.StatusBadRequest, err.Error())
 		default:
 			return nil, internalError("clear session project assignment", err)
@@ -467,8 +470,6 @@ func humaWorktreeReclassificationError(err error) error {
 		return apiError(http.StatusConflict, err.Error())
 	case errors.Is(err, db.ErrWorktreeMappingInvalid):
 		return apiError(http.StatusBadRequest, err.Error())
-	case strings.Contains(err.Error(), "required"):
-		return apiError(http.StatusBadRequest, err.Error())
 	default:
 		return internalError("worktree reclassification", err)
 	}
@@ -477,8 +478,6 @@ func humaWorktreeReclassificationError(err error) error {
 func humaWorktreeMappingError(err error) error {
 	switch {
 	case errors.Is(err, db.ErrWorktreeMappingInvalid):
-		return apiError(http.StatusBadRequest, err.Error())
-	case strings.Contains(err.Error(), "required"):
 		return apiError(http.StatusBadRequest, err.Error())
 	case errors.Is(err, db.ErrWorktreeMappingDuplicate):
 		return apiError(http.StatusConflict, "worktree mapping already exists")

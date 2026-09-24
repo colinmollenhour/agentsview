@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -8,12 +9,149 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func renderedPaths(pkg []Rendered) []string {
+	paths := make([]string, 0, len(pkg))
+	for _, artifact := range pkg {
+		paths = append(paths, filepath.ToSlash(artifact.RelativePath))
+	}
+	return paths
+}
+
+func artifactByBase(t *testing.T, pkg []Rendered, base string) Rendered {
+	t.Helper()
+	for _, artifact := range pkg {
+		if filepath.Base(artifact.RelativePath) == base {
+			return artifact
+		}
+	}
+	require.FailNow(t, "no artifact named "+base+" in "+strings.Join(renderedPaths(pkg), ", "))
+	return Rendered{}
+}
+
+func TestRenderPackage_HarnessArtifacts(t *testing.T) {
+	claude, err := RenderPackage(HarnessClaude, "dev", Remote{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		".claude/skills/agentsview-finding-history/SKILL.md",
+		".claude/skills/agentsview-finding-history/LICENSE",
+		".claude/agents/agentsview-search-conversations.md",
+	}, renderedPaths(claude))
+
+	agents, err := RenderPackage(HarnessAgents, "dev", Remote{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		".agents/skills/agentsview-finding-history/SKILL.md",
+		".agents/skills/agentsview-finding-history/LICENSE",
+	}, renderedPaths(agents))
+}
+
+func TestRenderPackage_ProtectsLicenseEdits(t *testing.T) {
+	pkg, err := RenderPackage(HarnessAgents, "dev", Remote{})
+	require.NoError(t, err)
+	license := artifactByBase(t, pkg, licenseFileName)
+
+	assert.Equal(t, StateCurrent, Classify([]byte(license.Content), license))
+	assert.Equal(t, StateModified,
+		Classify([]byte(license.Content+"\nlocal edit\n"), license))
+	assert.Equal(t, StateForeign, Classify([]byte("MIT License\n"), license))
+}
+
+func TestRenderPackage_ProtectsSearchAgentEdits(t *testing.T) {
+	pkg, err := RenderPackage(HarnessClaude, "dev", Remote{})
+	require.NoError(t, err)
+	agent := artifactByBase(t, pkg, "agentsview-search-conversations.md")
+
+	assert.Equal(t, StateCurrent, Classify([]byte(agent.Content), agent))
+	assert.Equal(t, StateModified,
+		Classify([]byte(agent.Content+"\nlocal edit\n"), agent))
+}
+
+func TestRenderRecallWorkflowContract(t *testing.T) {
+	rendered, err := RenderPackage(HarnessAgents, "dev", Remote{})
+	require.NoError(t, err)
+	require.NotEmpty(t, rendered)
+	skill := rendered[0].Content
+
+	assert.Contains(t, skill, "Search before guessing")
+	assert.Contains(t, skill, "inspect the current code first")
+	assert.Contains(t, skill, "already answered in this conversation")
+	assert.Contains(t, skill, "search_content")
+	assert.Contains(t, skill, "get_messages")
+	assert.Contains(t, skill, "limit: 10")
+	assert.Contains(t, skill, "top 2-5")
+	assert.Contains(t, skill, "next_from")
+	assert.Contains(t, skill, "subordinate")
+	assert.Contains(t, skill, "user accepted")
+	assert.Contains(t, skill, "verify the agent in effect")
+	assert.Contains(t, skill, "without that header")
+	assert.Contains(t, skill, "not registered in this session")
+	assert.NotContains(t, skill, ".claude/agents")
+	assert.Contains(t, skill, "semantic search failed")
+	assert.Contains(t, skill, "Do not fall back on authentication or wrong-target errors")
+	assert.NotContains(t, skill, "Copyright (c) 2025 Jesse Vincent")
+	assert.NotContains(t, skill, "mcp__plugin_episodic-memory")
+	assert.NotContains(t, skill, "50-100x")
+
+	license := artifactByBase(t, rendered, licenseFileName).Content
+	assert.Contains(t, license, "Copyright (c) 2025 Jesse Vincent")
+	assert.Contains(t, license, "Permission is hereby granted")
+	assert.Contains(t, license, "7e06519357777badd7a115d2014a7ef845904310")
+	assert.False(t, strings.HasPrefix(license, "---\n"))
+	assert.Equal(t, StateCurrent,
+		Classify([]byte(license), artifactByBase(t, rendered, licenseFileName)))
+}
+
+// TestRenderClaudeSkillDelegationGuard pins the Claude-specific delegation
+// guard: only the Claude harness renders the project agent directory into the
+// guard text.
+func TestRenderClaudeSkillDelegationGuard(t *testing.T) {
+	claude, err := RenderPackage(HarnessClaude, "dev", Remote{})
+	require.NoError(t, err)
+	require.NotEmpty(t, claude)
+	skill := claude[0].Content
+
+	assert.Contains(t, skill, "the project's")
+	assert.Contains(t, skill, ".claude/agents/` directory")
+	assert.Contains(t, skill, "without that header")
+	assert.Contains(t, skill, "registered as `agentsview`")
+}
+
+func TestRenderClaudeSearchAgentContract(t *testing.T) {
+	rendered, err := RenderPackage(HarnessClaude, "dev", Remote{})
+	require.NoError(t, err)
+	agent := artifactByBase(t, rendered, "agentsview-search-conversations.md").Content
+
+	assert.Contains(t, agent, "name: agentsview-search-conversations")
+	assert.Contains(t, agent, "model: haiku")
+	// The subagent reads untrusted archived transcripts. Claude Code treats
+	// `tools` as the complete set, and an allowlist cannot wildcard the MCP
+	// server segment, so the agent names the documented `agentsview` server
+	// and only its read-only search and message tools. A deny list would
+	// leave every other registered MCP server callable.
+	assert.Contains(t, agent,
+		"tools: mcp__agentsview__search_content, mcp__agentsview__get_messages")
+	assert.NotContains(t, agent, "disallowedTools:")
+	assert.NotContains(t, agent, "Ignore tools from every other")
+	assert.Contains(t, agent, "`mcp__agentsview__search_content`")
+	assert.Contains(t, agent, "`mcp__agentsview__get_messages`")
+	assert.Contains(t, agent, "incomplete evidence")
+	assert.Contains(t, agent, "### Summary")
+	assert.Contains(t, agent, "### Sources")
+	assert.Contains(t, agent, "### For Follow-Up")
+	assert.Contains(t, agent, "1,000 words")
+	assert.Contains(t, agent, "Read in detail")
+	assert.Contains(t, agent, "Summary only")
+	assert.Contains(t, agent, "Skimmed")
+	assert.Contains(t, agent, "ordinal range")
+	assert.NotContains(t, agent, "% match")
+	assert.NotContains(t, agent, "Copyright (c) 2025 Jesse Vincent")
+}
+
 func TestRemoteArgs(t *testing.T) {
 	assert.Empty(t, Remote{}.Args())
 	assert.Equal(t, " --server https://example.invalid",
 		Remote{Server: "https://example.invalid"}.Args())
-	assert.Equal(t,
-		" --server https://example.invalid --server-token-file token",
+	assert.Equal(t, " --server https://example.invalid --server-token-file token",
 		Remote{Server: "https://example.invalid", TokenFile: "token"}.Args())
 }
 
@@ -87,9 +225,9 @@ func TestRemoteArgsQuotesUnsafeValues(t *testing.T) {
 }
 
 func TestRemoteValidateRejectsControlCharacters(t *testing.T) {
-	assert.NoError(t, Remote{Server: "https://example.invalid"}.Validate())
-	assert.Error(t, Remote{Server: "https://example.invalid\nname: evil"}.Validate())
-	assert.Error(t, Remote{Server: "ok", TokenFile: "tok\ttab"}.Validate())
+	require.NoError(t, Remote{Server: "https://example.invalid"}.Validate())
+	require.Error(t, Remote{Server: "https://example.invalid\nname: evil"}.Validate())
+	require.Error(t, Remote{Server: "ok", TokenFile: "tok\ttab"}.Validate())
 
 	_, err := Render(HarnessClaude, "dev", Remote{Server: "a\nb"})
 	assert.Error(t, err, "Render must refuse a remote that would break the file")
