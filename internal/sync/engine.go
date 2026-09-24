@@ -4991,10 +4991,15 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 			return
 		}
 		if linkEligible {
-			if err := e.linkSubagentSessions(ctx); err != nil {
+			linked, err := e.linkSubagentSessions(ctx)
+			if err != nil {
 				errs = append(errs, fmt.Errorf(
 					"link subagent sessions after grouped reconciliation: %w", err,
 				))
+			} else if linked > 0 {
+				// The repair runs after per-group stats are folded into
+				// changed. A parent-only update still has to refresh clients.
+				changed = true
 			}
 		}
 		if persistEligible {
@@ -5479,12 +5484,18 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 		// runs before the incomplete-reconciliation error is built: a
 		// linking failure blocks the completed scopes' tombstoning below, so
 		// those scopes must join the retry roots rather than staying stale.
-		if err := e.linkSubagentSessions(ctx); err != nil {
+		linked, err := e.linkSubagentSessions(ctx)
+		if err != nil {
 			stats.RecordFailed()
 			stats.Aborted = true
 			retErr = fmt.Errorf(
 				"link subagent sessions after reconciliation: %w", err,
 			)
+		} else {
+			// Record after subagentLinkPending is sampled above. Folding
+			// the repair into that sample would keep the next unchanged
+			// poll on the global link path.
+			stats.RecordLinksUpdated(linked)
 		}
 	}
 	canTombstoneCompletedScopes :=
@@ -10780,9 +10791,12 @@ flush:
 		e.reportFinalizingProgress(
 			onProgress, writeMode, finalizingFileLinksDetail,
 		)
-		if err := e.linkSubagentSessions(postWriteCtx); err != nil {
+		linked, err := e.linkSubagentSessions(postWriteCtx)
+		if err != nil {
 			log.Printf("link subagent sessions: %v", err)
 			stats.RecordFailed()
+		} else {
+			stats.RecordLinksUpdated(linked)
 		}
 	}
 	e.reportFinalizingProgress(
@@ -10979,13 +10993,16 @@ func (e *Engine) reconcileSkippedSingleSessionSourceBaselines(
 	return nil
 }
 
-func (e *Engine) linkSubagentSessions(ctx context.Context) error {
+func (e *Engine) linkSubagentSessions(ctx context.Context) (int, error) {
 	if runtimeMetrics := reconciliationRuntimeMetricsFor(ctx); runtimeMetrics != nil {
 		runtimeMetrics.globalLinkPass()
 	}
-	err := e.db.LinkSubagentSessionsContext(ctx)
+	updated, err := e.db.LinkSubagentSessionsContext(ctx)
 	e.subagentLinkPending = err != nil
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return updated, nil
 }
 
 // drainResults consumes remaining items from the results

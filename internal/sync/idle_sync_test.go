@@ -91,6 +91,81 @@ func TestPollingRetriesFailedLinkWithoutNewSourceChanges(t *testing.T) {
 		"a successful retry must let polling return to idle")
 }
 
+func TestPendingLinkRetryEmitsSessionsWithoutSourceChanges(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		name := "single provider"
+		if grouped {
+			name = "grouped"
+		}
+		t.Run(name, func(t *testing.T) {
+			database := openTestDB(t)
+			root := t.TempDir()
+			writeGroupedClaudeFixture(t, root, "polled-link-retry")
+			seedGroupedSubagentFixture(t, database)
+			emitter := &fakeEmitter{}
+			engine := NewEngine(t.Context(), database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{
+					parser.AgentClaude: {root},
+				},
+				Machine: "local",
+				Emitter: emitter,
+			})
+			t.Cleanup(engine.Close)
+			raw, err := sql.Open("sqlite3", database.Path())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, raw.Close()) })
+			_, err = raw.Exec(`CREATE TRIGGER fail_polled_link
+				BEFORE UPDATE OF parent_session_id ON sessions
+				WHEN NEW.id = 'grouped-child'
+				BEGIN SELECT RAISE(FAIL, 'injected poll link failure'); END`)
+			require.NoError(t, err)
+			reconcile := func() error {
+				if grouped {
+					return engine.ReconcileProviderRootsGrouped(t.Context(),
+						[]ProviderRootsGroup{{
+							Agent: parser.AgentClaude, Roots: []string{root},
+						}})
+				}
+				return engine.ReconcileProviderRoots(
+					t.Context(), parser.AgentClaude, []string{root},
+				)
+			}
+
+			require.ErrorContains(t, reconcile(), "injected poll link failure")
+			requireGroupedChildParent(t, database, false,
+				"the failed link must remain pending")
+			_, err = raw.Exec(`DROP TRIGGER fail_polled_link`)
+			require.NoError(t, err)
+			polled, err := database.GetSessionFull(t.Context(), "polled-link-retry")
+			require.NoError(t, err)
+			require.NotNil(t, polled)
+			require.NotNil(t, polled.LocalModifiedAt)
+			unchangedAt := *polled.LocalModifiedAt
+			emitter.mu.Lock()
+			emitter.scopes = nil
+			emitter.mu.Unlock()
+
+			require.NoError(t, reconcile())
+			requireGroupedChildParent(t, database, true,
+				"the pending link must repair the parent")
+			polled, err = database.GetSessionFull(t.Context(), "polled-link-retry")
+			require.NoError(t, err)
+			require.NotNil(t, polled.LocalModifiedAt)
+			assert.Equal(t, unchangedAt, *polled.LocalModifiedAt,
+				"the retry must leave the unchanged transcript untouched")
+			assert.Equal(t, []string{"sessions"}, emitter.got(),
+				"a parent-link repair must refresh clients when nothing else changed")
+
+			emitter.mu.Lock()
+			emitter.scopes = nil
+			emitter.mu.Unlock()
+			require.NoError(t, reconcile())
+			assert.Empty(t, emitter.got(),
+				"an unchanged poll after the repair must not refresh clients")
+		})
+	}
+}
+
 func TestPollingRetriesFailedLinkDespiteCachedSourceFailure(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
