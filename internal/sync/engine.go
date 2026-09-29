@@ -8052,8 +8052,12 @@ func (e *Engine) syncAllLocked(
 	e.reportFinalizingProgress(
 		onProgress, writeMode, finalizingAllLinksDetail,
 	)
-	if err := e.db.LinkSubagentSessions(); err != nil {
+	linked, err := e.linkSubagentSessions(ctx)
+	if err != nil {
 		log.Printf("link subagent sessions: %v", err)
+		stats.RecordFailed()
+	} else {
+		stats.RecordLinksUpdated(linked)
 	}
 
 	e.reportFinalizingProgress(
