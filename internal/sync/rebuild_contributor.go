@@ -140,6 +140,7 @@ func mergeSyncStats(dst *SyncStats, src SyncStats) {
 	dst.TotalSessions += src.TotalSessions
 	dst.Synced += src.Synced
 	dst.CwdUpdated += src.CwdUpdated
+	dst.LinksUpdated += src.LinksUpdated
 	dst.Skipped += src.Skipped
 	dst.Failed += src.Failed
 	dst.OrphanedCopied += src.OrphanedCopied

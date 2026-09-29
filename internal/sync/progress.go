@@ -137,7 +137,7 @@ type SyncStats struct {
 
 func (s *SyncStats) shouldEmitSync() bool {
 	return s.Tombstoned > 0 ||
-		(!s.Aborted && (s.Synced > 0 || s.CwdUpdated > 0 || s.ArchiveRebuilt))
+		(!s.Aborted && (s.hasSessionChanges() || s.ArchiveRebuilt))
 }
 
 func (s *SyncStats) hasSessionChanges() bool {

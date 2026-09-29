@@ -162,11 +162,9 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 			},
 		},
 	)
-	if !stats.Aborted {
-		if err := affectedSessionIDs.link(ctx, e); err != nil {
-			stats.RecordFailed()
-			processErr = errors.Join(processErr, err)
-		}
+	if err := affectedSessionIDs.link(ctx, e, stats); err != nil {
+		stats.RecordFailed()
+		processErr = errors.Join(processErr, err)
 	}
 	e.anomalies.applyTo(&stats)
 	// Pass-level failures cannot be attributed to one container, so they

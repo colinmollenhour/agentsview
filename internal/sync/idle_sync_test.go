@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"testing/synctest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -167,6 +168,33 @@ func TestPendingLinkRetryEmitsSessionsWithoutSourceChanges(t *testing.T) {
 	}
 }
 
+func TestSyncThenRunEmitsForLinkOnlyRepair(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	writeGroupedClaudeFixture(t, root, "unchanged")
+	emitter := &fakeEmitter{}
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		Machine:   "local", Emitter: emitter,
+	})
+	t.Cleanup(engine.Close)
+	initial := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, initial.Failed)
+	require.False(t, database.NeedsResync())
+	seedGroupedSubagentFixture(t, database)
+	emitter.mu.Lock()
+	emitter.scopes = nil
+	emitter.mu.Unlock()
+
+	stats, err := engine.SyncThenRun(t.Context(), false, nil, func(bool) error { return nil })
+	require.NoError(t, err)
+	requireGroupedChildParent(t, database, true, "the sync must repair the parent")
+	require.Zero(t, stats.Synced, "the transcript did not change")
+	assert.Equal(t, 1, stats.LinksUpdated)
+	assert.Equal(t, []string{"sync"}, emitter.got(),
+		"a committed parent repair must notify clients")
+}
+
 func TestPollingRetriesFailedLinkDespiteCachedSourceFailure(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()
@@ -221,4 +249,88 @@ func TestUnchangedPollingSkipsGlobalLinking(t *testing.T) {
 	}
 	assert.Zero(t, metrics.snapshot(ReconciliationMetrics{}).GlobalLinkPasses,
 		"unchanged polling must not scan archive-wide spawn edges")
+}
+
+func TestCanceledChangedPathBatchRetriesLinksOnUnchangedPoll(t *testing.T) {
+	for _, watcher := range []bool{false, true} {
+		name := "plan"
+		if watcher {
+			name = "watcher"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				database := openTestDB(t)
+				root := t.TempDir()
+				path := filepath.Join(root, "project", "parent.jsonl")
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+				require.NoError(t, os.WriteFile(path, []byte(`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"start"},"cwd":"/tmp","sessionId":"parent"}
+{"type":"assistant","timestamp":"2024-01-01T10:01:00Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"spawn","name":"Agent","input":{"prompt":"child work"}}]}}
+{"type":"user","timestamp":"2024-01-01T10:02:00Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"spawn","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"child"}}
+`), 0o600))
+				require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+					ID: "agent-child", Agent: "claude", Project: "project", Machine: "local",
+				}))
+				const blockerAgent parser.AgentType = "cancel-blocker"
+				blockedRoot := t.TempDir()
+				blockedPath := filepath.Join(blockedRoot, "blocked.jsonl")
+				require.NoError(t, os.WriteFile(blockedPath, []byte("{}\n"), 0o600))
+				source := parser.SourceRef{Provider: blockerAgent, Key: blockedPath, DisplayPath: blockedPath, FingerprintKey: blockedPath}
+				blocker := &directStreamingProvider{
+					Def: parser.AgentDef{Type: blockerAgent, FileBased: true},
+					Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+						DiscoverSources: parser.CapabilitySupported, StreamingDiscovery: parser.CapabilitySupported,
+						WatchSources: parser.CapabilitySupported, FindSource: parser.CapabilitySupported,
+					}},
+					source: &source, parseRelease: make(chan struct{}),
+				}
+				engine := NewEngine(t.Context(), database, EngineConfig{
+					AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}, blockerAgent: {blockedRoot}},
+					Machine:   "local",
+					ProviderFactories: append(parser.ProviderFactories(),
+						directStreamingFactory{provider: blocker}),
+					ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+						blockerAgent: parser.ProviderMigrationProviderAuthoritative,
+					},
+				})
+				defer engine.Close()
+				paths := []string{path, blockedPath}
+				plan, err := engine.PlanChangedPathsContext(t.Context(), paths)
+				require.NoError(t, err)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				done := make(chan error, 1)
+				go func() {
+					if watcher {
+						done <- engine.SyncPathsContext(ctx, paths)
+					} else {
+						_, err := engine.SyncChangedPathPlanContext(ctx, plan, nil)
+						done <- err
+					}
+				}()
+				// The second provider blocks on cancellation, so the first result has
+				// entered the collector but has not yet reached the final batch flush.
+				synctest.Wait()
+				progress, active := engine.CurrentProgress()
+				require.True(t, active)
+				require.Equal(t, 1, progress.SessionsDone)
+				cancel()
+				require.ErrorIs(t, <-done, context.Canceled)
+				require.True(t, engine.LastSyncStats().Aborted)
+				require.Equal(t, 1, engine.LastSyncStats().Synced)
+				var edgeCount int
+				require.NoError(t, database.Reader().QueryRow(t.Context(), `
+					SELECT count(*) FROM tool_calls
+					WHERE session_id='parent' AND subagent_session_id='agent-child'
+				`).Scan(&edgeCount))
+				require.Equal(t, 1, edgeCount, "cancellation must preserve the committed spawn edge")
+				require.NoError(t, engine.ReconcileProviderRootsGrouped(t.Context(), []ProviderRootsGroup{
+					{Agent: parser.AgentClaude, Roots: []string{root}},
+				}))
+				child, err := database.GetSession(t.Context(), "agent-child")
+				require.NoError(t, err)
+				require.NotNil(t, child)
+				assert.Equal(t, new("parent"), child.ParentSessionID, "an unchanged poll must finish links from the canceled batch")
+			})
+		})
+	}
 }

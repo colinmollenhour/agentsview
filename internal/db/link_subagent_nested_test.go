@@ -473,7 +473,9 @@ func TestLinkSubagentSessionsRepairsLegacySelfParentOnce(t *testing.T) {
 	forceSelfParent(t, d, "path-derived")
 	forceBackfilledSelfParent(t, d, "backfilled")
 
-	require.NoError(t, d.LinkSubagentSessions())
+	updated, err := d.LinkSubagentSessionsContext(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 4, updated, "legacy parent repairs must count as session changes")
 
 	for _, tc := range []struct {
 		id         string
@@ -498,7 +500,9 @@ func TestLinkSubagentSessionsRepairsLegacySelfParentOnce(t *testing.T) {
 		"a real parent must survive the repair")
 
 	forceSelfParent(t, d, "edgeless")
-	require.NoError(t, d.LinkSubagentSessions())
+	updated, err = d.LinkSubagentSessionsContext(t.Context())
+	require.NoError(t, err)
+	assert.Zero(t, updated, "completed legacy repairs must not count again")
 	again, err := d.GetSession(t.Context(), "edgeless")
 	requireNoError(t, err, "GetSession edgeless after second link")
 	require.NotNil(t, again.ParentSessionID)

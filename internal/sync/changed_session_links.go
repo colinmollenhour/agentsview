@@ -24,7 +24,13 @@ func (ids changedSessionLinks) observe(job syncJob, prefix string) {
 
 // link runs with syncMu held. A failure leaves the global link pending so an
 // unchanged poll retries it even when the durable repair queue also failed.
-func (ids changedSessionLinks) link(ctx context.Context, e *Engine) error {
+func (ids changedSessionLinks) link(ctx context.Context, e *Engine, stats SyncStats) error {
+	if stats.Aborted {
+		// Cancellation can leave committed writes whose new edges have not
+		// been linked. Let the next poll finish without delaying cancellation.
+		e.subagentLinkPending = e.subagentLinkPending || stats.Synced > 0
+		return nil
+	}
 	if len(ids) == 0 {
 		return nil
 	}

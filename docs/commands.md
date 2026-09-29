@@ -230,8 +230,9 @@ The server shuts down cleanly on `Ctrl+C`, flushing the database and stopping
 file watchers.
 
 On current `main`, watcher batches link subagent relationships only for affected
-sessions. Unchanged polls skip archive-wide linking. Poll logs identify the
-provider roots being checked and report how long the pass took.
+sessions. Unchanged polls skip archive-wide linking unless a failed or canceled
+batch left unfinished links. Poll logs identify the provider roots being checked
+and report how long the pass took.
 
 Unchanged broken or missing source files are skipped through the failure cache
 described in [Sync Behavior](configuration.md#sync-behavior). Grok

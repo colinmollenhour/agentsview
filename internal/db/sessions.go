@@ -1894,7 +1894,8 @@ func (db *DB) LinkSubagentSessions() error {
 func (db *DB) LinkSubagentSessionsContext(ctx context.Context) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := db.repairLegacySelfParentedSessions(ctx); err != nil {
+	repaired, err := db.repairLegacySelfParentedSessions(ctx)
+	if err != nil {
 		return 0, err
 	}
 
@@ -1913,7 +1914,7 @@ func (db *DB) LinkSubagentSessionsContext(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("counting linked subagent sessions: %w", err)
 	}
-	return int(updated), nil
+	return repaired + int(updated), nil
 }
 
 // selfParentRepairStateKey marks the archive as having cleared the
@@ -1944,7 +1945,7 @@ const clearSelfParentedSessionsSQL = `
 // of sessions (parent_session_id IS id cannot use idx_sessions_parent), so
 // it is gated by a pg_sync_state marker rather than repeated on every sync.
 // The marker and the clear commit together so a failed run retries.
-func (db *DB) repairLegacySelfParentedSessions(ctx context.Context) error {
+func (db *DB) repairLegacySelfParentedSessions(ctx context.Context) (int, error) {
 	writer := db.getWriter()
 	var repaired int
 	if err := writer.QueryRowContext(
@@ -1952,28 +1953,33 @@ func (db *DB) repairLegacySelfParentedSessions(ctx context.Context) error {
 		"SELECT EXISTS(SELECT 1 FROM pg_sync_state WHERE key = ?)",
 		selfParentRepairStateKey,
 	).Scan(&repaired); err != nil {
-		return fmt.Errorf("checking self-parent repair state: %w", err)
+		return 0, fmt.Errorf("checking self-parent repair state: %w", err)
 	}
 	if repaired != 0 {
-		return nil
+		return 0, nil
 	}
 	tx, err := writer.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("beginning self-parent repair: %w", err)
+		return 0, fmt.Errorf("beginning self-parent repair: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, clearSelfParentedSessionsSQL); err != nil {
-		return fmt.Errorf("clearing legacy self-parented sessions: %w", err)
+	res, err := tx.ExecContext(ctx, clearSelfParentedSessionsSQL)
+	if err != nil {
+		return 0, fmt.Errorf("clearing legacy self-parented sessions: %w", err)
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("counting legacy self-parent repairs: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO pg_sync_state (key, value) VALUES (?, '1')
 		ON CONFLICT(key) DO NOTHING`, selfParentRepairStateKey); err != nil {
-		return fmt.Errorf("recording self-parent repair state: %w", err)
+		return 0, fmt.Errorf("recording self-parent repair state: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing self-parent repair: %w", err)
+		return 0, fmt.Errorf("committing self-parent repair: %w", err)
 	}
-	return nil
+	return int(updated), nil
 }
 
 // linkSubagentSessionsForSessionsQuery is linkSubagentSessionsQuery

@@ -1793,12 +1793,9 @@ func (e *Engine) applyChangedPathSyncLocked(
 			},
 		},
 	)
-	var linkErr error
-	if !stats.Aborted {
-		linkErr = affectedSessionIDs.link(ctx, e)
-		if linkErr != nil {
-			stats.RecordFailed()
-		}
+	linkErr := affectedSessionIDs.link(ctx, e, stats)
+	if linkErr != nil {
+		stats.RecordFailed()
 	}
 	e.anomalies.applyTo(&stats)
 	complete := prepared.classificationErr == nil && ctx.Err() == nil &&
@@ -6829,6 +6826,7 @@ func mergeReconciliationSyncStats(dst *SyncStats, src SyncStats) {
 	dst.cwdFilteredSessions += src.cwdFilteredSessions
 	dst.cwdFilteredFiles += src.cwdFilteredFiles
 	dst.CwdUpdated += src.CwdUpdated
+	dst.LinksUpdated += src.LinksUpdated
 	dst.Aborted = dst.Aborted || src.Aborted
 	if !dst.deferredRetryOverflow {
 		deferred := dst.Deferred
