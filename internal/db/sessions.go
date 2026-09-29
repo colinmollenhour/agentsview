@@ -1890,11 +1890,17 @@ func (db *DB) LinkSubagentSessions() error {
 
 // LinkSubagentSessionsContext is LinkSubagentSessions with caller-controlled
 // cancellation for bounded sync paths. The count is the number of session
-// rows whose parent link changed.
+// rows whose parent link changed. Legacy repairs and ordinary linking commit
+// together so an error leaves no unreported parent changes.
 func (db *DB) LinkSubagentSessionsContext(ctx context.Context) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	repaired, err := db.repairLegacySelfParentedSessions(ctx)
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning subagent linking: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	repaired, err := repairLegacySelfParentedSessions(ctx, tx)
 	if err != nil {
 		return 0, err
 	}
@@ -1906,13 +1912,16 @@ func (db *DB) LinkSubagentSessionsContext(ctx context.Context) (int, error) {
 	// session after a mirror's cutoff would otherwise never re-push it
 	// (see updateSessionSignalsTx and ReplaceSessionUsageEvents for the
 	// same pattern).
-	res, err := db.getWriter().ExecContext(ctx, linkSubagentSessionsQuery)
+	res, err := tx.ExecContext(ctx, linkSubagentSessionsQuery)
 	if err != nil {
 		return 0, fmt.Errorf("linking subagent sessions: %w", err)
 	}
 	updated, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("counting linked subagent sessions: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing subagent linking: %w", err)
 	}
 	return repaired + int(updated), nil
 }
@@ -1944,11 +1953,11 @@ const clearSelfParentedSessionsSQL = `
 // affected rows would never re-enter the linker. The pass is a full scan
 // of sessions (parent_session_id IS id cannot use idx_sessions_parent), so
 // it is gated by a pg_sync_state marker rather than repeated on every sync.
-// The marker and the clear commit together so a failed run retries.
-func (db *DB) repairLegacySelfParentedSessions(ctx context.Context) (int, error) {
-	writer := db.getWriter()
+// The caller commits the marker, repair, and ordinary linking together so a
+// failed run retries every change.
+func repairLegacySelfParentedSessions(ctx context.Context, tx *sql.Tx) (int, error) {
 	var repaired int
-	if err := writer.QueryRowContext(
+	if err := tx.QueryRowContext(
 		ctx,
 		"SELECT EXISTS(SELECT 1 FROM pg_sync_state WHERE key = ?)",
 		selfParentRepairStateKey,
@@ -1958,11 +1967,6 @@ func (db *DB) repairLegacySelfParentedSessions(ctx context.Context) (int, error)
 	if repaired != 0 {
 		return 0, nil
 	}
-	tx, err := writer.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("beginning self-parent repair: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
 	res, err := tx.ExecContext(ctx, clearSelfParentedSessionsSQL)
 	if err != nil {
 		return 0, fmt.Errorf("clearing legacy self-parented sessions: %w", err)
@@ -1975,9 +1979,6 @@ func (db *DB) repairLegacySelfParentedSessions(ctx context.Context) (int, error)
 		INSERT INTO pg_sync_state (key, value) VALUES (?, '1')
 		ON CONFLICT(key) DO NOTHING`, selfParentRepairStateKey); err != nil {
 		return 0, fmt.Errorf("recording self-parent repair state: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("committing self-parent repair: %w", err)
 	}
 	return int(updated), nil
 }

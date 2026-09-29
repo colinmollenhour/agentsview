@@ -510,6 +510,39 @@ func TestLinkSubagentSessionsRepairsLegacySelfParentOnce(t *testing.T) {
 		"the repair is one-time per archive; ingest sanitization protects new rows")
 }
 
+func TestLinkSubagentSessionsRollsBackLegacyRepairOnFailure(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "legacy", "project")
+	forceSelfParent(t, d, "legacy")
+	insertSession(t, d, "parent", "project")
+	insertSession(t, d, "child", "project")
+	insertMessages(t, d, spawnEdgeTo("parent", "child", "spawn"))
+	_, err := d.getWriter().Exec(t.Context(), `CREATE TRIGGER fail_main_link
+		BEFORE UPDATE OF parent_session_id ON sessions WHEN NEW.id = 'child'
+		BEGIN SELECT RAISE(FAIL, 'injected main link failure'); END`)
+	require.NoError(t, err)
+
+	updated, err := d.LinkSubagentSessionsContext(t.Context())
+	require.ErrorContains(t, err, "injected main link failure")
+	assert.Zero(t, updated)
+	legacy, err := d.GetSession(t.Context(), "legacy")
+	require.NoError(t, err)
+	require.NotNil(t, legacy)
+	assert.Equal(t, new("legacy"), legacy.ParentSessionID,
+		"a failed linking pass must not commit an unreported legacy repair")
+
+	_, err = d.getWriter().Exec(t.Context(), "DROP TRIGGER fail_main_link")
+	require.NoError(t, err)
+	updated, err = d.LinkSubagentSessionsContext(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 2, updated, "retry must count both the legacy repair and ordinary link")
+	legacy, err = d.GetSession(t.Context(), "legacy")
+	require.NoError(t, err)
+	require.NotNil(t, legacy)
+	assert.Nil(t, legacy.ParentSessionID)
+	assert.Equal(t, "parent", parentOfSession(t, d, "child"))
+}
+
 // TestLinkSubagentSessionsConvergesAcrossIngestionOrder covers the
 // ingestion-order case raised in review. Conflicting spawn edges (reachable
 // through copied or forked history) can arrive in any order, and either one
