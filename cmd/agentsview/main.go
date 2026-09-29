@@ -2989,14 +2989,14 @@ func runArchiveAudit(
 }
 
 // workerResultHasSessionChanges reports whether a worker pass changed rows
-// clients must refetch. Cwd-only reconciliations ride the serialized
-// SyncStats payload rather than the summary counters, so the audit emit
-// must consult it or a cwd-only pass would leave the UI stale.
+// clients must refetch. Cwd-only changes and parent-link repairs ride the
+// serialized SyncStats payload rather than the summary counters, so the audit
+// emit must consult it or a metadata-only pass would leave the UI stale.
 func workerResultHasSessionChanges(result workerResult) bool {
 	if result.Synced > 0 || result.Tombstoned > 0 {
 		return true
 	}
-	return result.Stats != nil && result.Stats.CwdUpdated > 0
+	return result.Stats != nil && (result.Stats.CwdUpdated > 0 || result.Stats.LinksUpdated > 0)
 }
 
 // scheduledSyncEngine is the reconciliation surface the scheduled pass needs.

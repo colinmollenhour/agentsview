@@ -277,6 +277,9 @@ func workerWritePassLocked(
 	}
 
 	result, workerErr := launchSyncWorker(ctx, cfg, mode, onLine)
+	if result.Stats != nil {
+		engine.RetainSubagentLinkRetryExclusive(result.Stats.LinksPending)
+	}
 
 	// Lock recovery must not die with the caller's context: foreground
 	// syncs pass the HTTP request context, and a client disconnect

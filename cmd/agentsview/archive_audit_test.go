@@ -439,7 +439,7 @@ func TestSyncWorkerAuditMarksMissedSourceMissing(t *testing.T) {
 		"the audit worker must durably remove the tombstoned source's hash key")
 }
 
-func TestWorkerResultHasSessionChangesSeesCwdOnlyStats(t *testing.T) {
+func TestWorkerResultHasSessionChangesSeesMetadataOnlyStats(t *testing.T) {
 	assert.False(t, workerResultHasSessionChanges(workerResult{}))
 	assert.True(t, workerResultHasSessionChanges(workerResult{Synced: 1}))
 	assert.True(t, workerResultHasSessionChanges(workerResult{Tombstoned: 1}))
@@ -447,4 +447,8 @@ func TestWorkerResultHasSessionChangesSeesCwdOnlyStats(t *testing.T) {
 	cwdOnly := workerResult{Stats: &sync.SyncStats{CwdUpdated: 1}}
 	assert.True(t, workerResultHasSessionChanges(cwdOnly),
 		"a cwd-only audit pass must still notify SSE clients")
+
+	linksOnly := workerResult{Stats: &sync.SyncStats{LinksUpdated: 1}}
+	assert.True(t, workerResultHasSessionChanges(linksOnly),
+		"a link-only audit pass must still notify SSE clients")
 }

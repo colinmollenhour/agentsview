@@ -346,10 +346,12 @@ func TestSyncEngineCursorResolvedFilteredCwdIsReconciled(t *testing.T) {
 	}))
 	require.NoError(t, os.MkdirAll(workspace, 0o755))
 
+	emitter := &fakeEmitter{}
 	filtered := sync.NewEngine(t.Context(), d, sync.EngineConfig{
 		AgentDirs:          map[parser.AgentType][]string{parser.AgentCursor: {root}},
 		Machine:            "local",
 		IncludeCwdPrefixes: []string{oldWorkspace},
+		Emitter:            emitter,
 	})
 	t.Cleanup(func() { filtered.Close() })
 	stats := filtered.SyncAll(t.Context(), nil)
@@ -361,6 +363,25 @@ func TestSyncEngineCursorResolvedFilteredCwdIsReconciled(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.Equal(t, workspace, stored.Cwd)
+
+	// Removing the workspace changes only its metadata; a partial poll must
+	// still notify clients without scanning unrelated parent links.
+	require.NoError(t, os.RemoveAll(workspace))
+	emitter.mu.Lock()
+	emitter.scopes = nil
+	emitter.mu.Unlock()
+	stats, _, err = filtered.ReconcileWatchRootsWithStats(
+		t.Context(), []string{root}, false, nil,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Synced)
+	assert.NotZero(t, stats.CwdUpdated)
+	assert.Zero(t, filtered.LastReconciliationResult().Metrics.GlobalLinkPasses)
+	assert.Equal(t, []string{"sessions"}, emitter.got())
+	stored, err = d.GetSession(t.Context(), fullID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Empty(t, stored.Cwd)
 }
 
 func TestSyncEngineCursorOversizedTranscriptReconcilesWorkspace(t *testing.T) {

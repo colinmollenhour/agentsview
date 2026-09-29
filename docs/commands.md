@@ -234,6 +234,11 @@ sessions. Unchanged polls skip archive-wide linking unless a failed or canceled
 batch left unfinished links. Poll logs identify the provider roots being checked
 and report how long the pass took.
 
+During polling, changes to working-directory metadata refresh clients without
+triggering global parent linking. Worker processes return link repairs and
+unfinished linking to the daemon, so clients see repaired links and later polls
+retry failed linking.
+
 Unchanged broken or missing source files are skipped through the failure cache
 described in [Sync Behavior](configuration.md#sync-behavior). Grok
 companion-file events use normal content-fingerprint checks, so repeated

@@ -514,3 +514,98 @@ func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {
 	assert.True(t, result.DiscoveryComplete)
 	assert.Equal(t, 3, result.Synced)
 }
+
+// Run the real worker body and protocol through the daemon's writer handoff.
+// Only process creation is replaced, keeping both sides on temporary archives.
+func TestWorkerParentLinkHandoff(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     string
+		failLink bool
+	}{
+		{name: "sync repair", mode: "sync"},
+		{name: "sync retry", mode: "sync", failLink: true},
+		{name: "audit retry", mode: "audit", failLink: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfigWithClaudeFixture(t)
+			var initial bytes.Buffer
+			require.NoError(t, runSyncWorker(cfg, "startup", &initial))
+			database, lock := openTestWriteDB(t, cfg)
+			for _, id := range []string{"worker-parent", "worker-child"} {
+				require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+					ID: id, Agent: "zencoder", Project: "project", Machine: "local",
+					RelationshipType: "continuation",
+				}))
+			}
+			require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+				SessionID: "worker-parent", Ordinal: 0, Role: "assistant",
+				Content: "spawn child", HasToolUse: true,
+				ToolCalls: []db.ToolCall{{
+					ToolUseID: "spawn", ToolName: "Task", SubagentSessionID: "worker-child",
+				}},
+			}}))
+			if tc.mode == "audit" {
+				// An audit links after a source change; unlike full sync it skips
+				// global linking when every source is unchanged.
+				path := filepath.Join(cfg.AgentDirs[parser.AgentClaude][0], "-home-proj0", "new-session.jsonl")
+				content := testjsonl.NewSessionBuilder().
+					AddClaudeUser("2026-01-01T00:00:00Z", "changed transcript").
+					AddClaudeAssistant("2026-01-01T00:00:01Z", "new reply").String()
+				require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+			}
+			raw, err := sql.Open("sqlite3", cfg.DBPath)
+			require.NoError(t, err)
+			defer raw.Close()
+			if tc.failLink {
+				_, err = raw.ExecContext(t.Context(), `CREATE TRIGGER fail_worker_link
+					BEFORE UPDATE OF parent_session_id ON sessions WHEN NEW.id = 'worker-child'
+					BEGIN SELECT RAISE(FAIL, 'injected worker link failure'); END`)
+				require.NoError(t, err)
+			}
+			em := &scopedEmitter{scopes: make(chan string, 8)}
+			engineConfig := workerEngineConfig(cfg)
+			engineConfig.Emitter = em
+			engine := sync.NewEngine(t.Context(), database, engineConfig)
+			defer engine.Close()
+			var terminal workerResult
+			restore := stubLaunchSyncWorker(t, func(
+				ctx context.Context, cfg config.Config, mode string, _ func(workerLine),
+			) (workerResult, error) {
+				var wire bytes.Buffer
+				workerErr := runSyncWorkerContext(ctx, cfg, mode, &wire)
+				terminal = decodeSingleResult(t, &wire)
+				return terminal, workerErr
+			})
+			defer restore()
+			if tc.mode == "sync" {
+				_, _, err = runWorkerSyncPass(t.Context(), t.Context(), cfg, engine, database, lock, false, nil)
+				require.Zero(t, terminal.Synced)
+			} else {
+				err = runArchiveAudit(t.Context(), cfg, engine, database, lock, em)
+				require.Equal(t, 1, terminal.Synced)
+			}
+			require.Zero(t, terminal.Tombstoned)
+			require.NotNil(t, terminal.Stats)
+			require.Zero(t, terminal.Stats.CwdUpdated)
+			if tc.failLink {
+				require.Error(t, err)
+				_, err = raw.ExecContext(t.Context(), `DROP TRIGGER fail_worker_link`)
+				require.NoError(t, err)
+				require.NoError(t, engine.ReconcileProviderRootsGrouped(t.Context(), []sync.ProviderRootsGroup{
+					{Agent: parser.AgentClaude, Roots: cfg.AgentDirs[parser.AgentClaude]},
+				}))
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, 1, statsFromWorkerResult(terminal).LinksUpdated)
+				require.Len(t, em.scopes, 1, "a link-only worker repair must refresh clients")
+				assert.Equal(t, "sync", <-em.scopes)
+			}
+			child, err := database.GetSession(t.Context(), "worker-child")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			assert.Equal(t, new("worker-parent"), child.ParentSessionID,
+				"the unchanged poll must finish links left by a failed worker")
+		})
+	}
+}

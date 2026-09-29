@@ -87,10 +87,12 @@ type SyncStats struct {
 	CwdUpdated int `json:"cwd_updated,omitempty"`
 	// LinksUpdated counts parent-link repairs from a global subagent linking
 	// pass. A pending retry can update parent_session_id while the poll's
-	// sync stats and tombstone count stay zero. The flag lives only in the
-	// process that owns the pending retry, so it is not part of the worker
-	// result payload.
-	LinksUpdated int `json:"-"`
+	// sync stats and tombstone count stay zero. Workers carry the count back
+	// to the daemon so it can notify clients about link-only repairs.
+	LinksUpdated int `json:"links_updated,omitempty"`
+	// LinksPending is the worker's terminal snapshot of unfinished linking.
+	// The daemon retains it for its next poll when the worker exits.
+	LinksPending bool `json:"links_pending,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters

@@ -237,6 +237,7 @@ func runSyncWorkerStartup(
 		result = workerResultFromStats(ctx, engine.SyncAll(ctx, onProgress))
 	}
 
+	result.Stats.LinksPending = engine.PendingSubagentLinks()
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
 		return fmt.Errorf("sync worker %s: %s", mode, result.Status)
@@ -278,6 +279,7 @@ func runSyncWorkerResyncBuild(
 
 	_, stats, buildErr := engine.ResyncBuild(ctx, onProgress)
 	result := resyncBuildResultFromStats(ctx, stats, buildErr)
+	result.Stats.LinksPending = engine.PendingSubagentLinks()
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
 		if buildErr != nil {

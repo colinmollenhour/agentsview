@@ -10,6 +10,19 @@ import (
 // changedSessionLinks collects only sessions reached by a changed-path batch.
 type changedSessionLinks map[string]struct{}
 
+// PendingSubagentLinks reports unfinished linking for a worker's terminal result.
+func (e *Engine) PendingSubagentLinks() bool {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	return e.subagentLinkPending
+}
+
+// RetainSubagentLinkRetryExclusive retains a worker's unfinished linking without
+// clearing any retry already owned by the daemon. The caller holds syncMu.
+func (e *Engine) RetainSubagentLinkRetryExclusive(pending bool) {
+	e.subagentLinkPending = e.subagentLinkPending || pending
+}
+
 func (ids changedSessionLinks) observe(job syncJob, prefix string) {
 	if job.incremental != nil {
 		ids[job.incremental.sessionID] = struct{}{}

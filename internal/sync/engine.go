@@ -4571,7 +4571,9 @@ func startupReconciliationSucceeded(
 // acknowledged startup is a no-op rather than a double-release; the last-sync
 // bookkeeping and emit re-run per pass by design.
 func (e *Engine) RecordStartupReconciled(stats SyncStats, err error) {
+	e.syncMu.Lock()
 	e.RecordStartupReconciledExclusive(stats, err)
+	e.syncMu.Unlock()
 	e.FinishStartupReconciled(stats)
 }
 
@@ -4582,6 +4584,7 @@ func (e *Engine) RecordStartupReconciled(stats SyncStats, err error) {
 // archive-scale worker. FinishStartupReconciled completes the tail that must
 // run outside the lock.
 func (e *Engine) RecordStartupReconciledExclusive(stats SyncStats, err error) {
+	e.RetainSubagentLinkRetryExclusive(stats.LinksPending)
 	e.mu.Lock()
 	if err == nil && !stats.Aborted {
 		e.lastSync = time.Now()
@@ -5492,7 +5495,7 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 	// group instead, consuming the eligibility recorded here; tombstoning
 	// below then proceeds without the linking gate, which is safe because
 	// linking is idempotent and retried on the caller's next pass.
-	e.subagentLinkPending = e.subagentLinkPending || stats.hasSessionChanges()
+	e.subagentLinkPending = e.subagentLinkPending || stats.Synced > 0 || stats.Tombstoned > 0
 	if retErr == nil && stats.Failed == 0 && !stats.Aborted {
 		eligibility.link = fullCoverage || e.subagentLinkPending
 	}
