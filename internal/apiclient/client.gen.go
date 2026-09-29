@@ -21092,6 +21092,8 @@ type SyncSyncStats struct {
 	Anomalies      *SyncAnomalyStats       `json:"anomalies,omitempty"`
 	CwdUpdated     *int64                  `json:"cwd_updated,omitempty"`
 	Failed         int64                   `json:"failed"`
+	LinksPending   *bool                   `json:"links_pending,omitempty"`
+	LinksUpdated   *int64                  `json:"links_updated,omitempty"`
 	OrphanedCopied *int64                  `json:"orphaned_copied,omitempty"`
 	RebuildPhases  []SyncRebuildPhaseStats `json:"rebuild_phases,omitempty"`
 	Skipped        int64                   `json:"skipped"`

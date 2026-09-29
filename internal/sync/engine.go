@@ -5495,7 +5495,7 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 	// group instead, consuming the eligibility recorded here; tombstoning
 	// below then proceeds without the linking gate, which is safe because
 	// linking is idempotent and retried on the caller's next pass.
-	e.subagentLinkPending = e.subagentLinkPending || stats.Synced > 0 || stats.Tombstoned > 0
+	e.subagentLinkPending = e.subagentLinkPending || stats.Synced > 0
 	if retErr == nil && stats.Failed == 0 && !stats.Aborted {
 		eligibility.link = fullCoverage || e.subagentLinkPending
 	}
@@ -9813,6 +9813,8 @@ func (e *Engine) syncProviderDBBackedAgent(
 	if pendingCount > 0 {
 		stats.TotalSessions += pendingCount
 		stats.RecordSynced(written)
+		// Retain linking if cancellation skips the final full-sync pass.
+		e.subagentLinkPending = e.subagentLinkPending || written > 0
 		if verbose {
 			log.Printf(
 				"%s write: %d sessions in %s",

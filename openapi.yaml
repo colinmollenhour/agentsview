@@ -7242,6 +7242,11 @@ components:
         failed:
           format: int64
           type: integer
+        links_pending:
+          type: boolean
+        links_updated:
+          format: int64
+          type: integer
         orphaned_copied:
           format: int64
           type: integer

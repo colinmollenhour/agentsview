@@ -18197,29 +18197,42 @@ func TestSyncAllTombstonesStaleClaudeForkAfterZeroResultParse(t *testing.T) {
 		"the unchanged original and rowless replay should both use source freshness")
 }
 
-func TestFullSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
+func TestSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
 	tests := []struct {
 		name string
-		run  func(*testEnv, context.Context) sync.SyncStats
+		run  func(*testing.T, *testEnv, context.Context) sync.SyncStats
 	}{
 		{
 			name: "SyncAll",
-			run: func(env *testEnv, ctx context.Context) sync.SyncStats {
+			run: func(_ *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
 				return env.engine.SyncAll(ctx, nil)
 			},
 		},
 		{
 			name: "SyncAllSince",
-			run: func(env *testEnv, ctx context.Context) sync.SyncStats {
+			run: func(_ *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
 				return env.engine.SyncAllSince(ctx, time.Time{}, nil)
 			},
 		},
 		{
 			name: "SyncRootsSince",
-			run: func(env *testEnv, ctx context.Context) sync.SyncStats {
+			run: func(_ *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
 				return env.engine.SyncRootsSince(
 					ctx, []string{env.claudeDir}, time.Time{}, nil,
 				)
+			},
+		},
+		{
+			name: "ReconcileWatchRoots",
+			run: func(t *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
+				t.Helper()
+				stats, _, err := env.engine.ReconcileWatchRootsWithStats(
+					ctx, []string{env.claudeDir}, false, nil,
+				)
+				require.NoError(t, err)
+				assert.Zero(t, env.engine.LastReconciliationResult().Metrics.GlobalLinkPasses,
+					"source-missing metadata must not request global parent linking")
+				return stats
 			},
 		},
 	}
@@ -18263,7 +18276,7 @@ func TestFullSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
 				[]db.SessionSourcePath{{Agent: "claude", FilePath: forkPath}},
 			))
 
-			stats := tt.run(env, t.Context())
+			stats := tt.run(t, env, t.Context())
 			assert.Zero(t, stats.Synced,
 				"the replay tombstone must not count as an ordinary sync write")
 			assert.Equal(t, []string{"sessions"}, emitter.got(),

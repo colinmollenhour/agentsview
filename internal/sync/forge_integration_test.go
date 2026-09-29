@@ -1,6 +1,7 @@
 package sync_test
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json/v2"
 	"os"
@@ -558,6 +559,41 @@ func TestSyncForgeSubagentLinkFailureRetriesOnUnchangedPoll(t *testing.T) {
 		_, err := tx.ExecContext(t.Context(), "DROP TRIGGER fail_subagent_link")
 		return err
 	}))
+	require.NoError(t, env.engine.ReconcileProviderRootsGrouped(
+		t.Context(), []sync.ProviderRootsGroup{{
+			Agent: parser.AgentForge, Roots: []string{env.forgeDir},
+		}},
+	))
+	child, err = env.db.GetSession(t.Context(), "forge:child-conv")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.NotNil(t, child.ParentSessionID)
+	assert.Equal(t, "forge:parent-conv", *child.ParentSessionID)
+}
+
+func TestSyncForgeCanceledImportRetriesLinksOnUnchangedPoll(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentForge)
+	forge := createForgeDB(t, env.forgeDir)
+	forge.addConversation(t, "parent-conv", "Parent",
+		forgeParentContext("child-conv"),
+		"2026-05-02 09:00:00", "2026-05-02 09:01:00", "")
+	forge.addConversation(t, "child-conv", "Child",
+		forgeTestContext("Child work.", "Child done."),
+		"2026-05-02 09:00:30", "2026-05-02 09:01:30", "")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stats := env.engine.SyncAll(ctx, func(progress sync.Progress) {
+		if progress.SessionsDone == 2 {
+			cancel()
+		}
+	})
+	require.True(t, stats.Aborted)
+	require.Equal(t, 2, stats.Synced)
+	child, err := env.db.GetSession(t.Context(), "forge:child-conv")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.Nil(t, child.ParentSessionID)
+
 	require.NoError(t, env.engine.ReconcileProviderRootsGrouped(
 		t.Context(), []sync.ProviderRootsGroup{{
 			Agent: parser.AgentForge, Roots: []string{env.forgeDir},

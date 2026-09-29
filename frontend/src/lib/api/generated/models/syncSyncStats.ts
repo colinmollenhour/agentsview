@@ -9,6 +9,8 @@ export interface SyncSyncStats {
   anomalies?: SyncAnomalyStats;
   cwd_updated?: number;
   failed: number;
+  links_pending?: boolean;
+  links_updated?: number;
   orphaned_copied?: number;
   rebuild_phases?: SyncRebuildPhaseStats[];
   skipped: number;
