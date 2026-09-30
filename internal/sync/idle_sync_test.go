@@ -195,6 +195,114 @@ func TestSyncThenRunEmitsForLinkOnlyRepair(t *testing.T) {
 		"a committed parent repair must notify clients")
 }
 
+func TestQueuedParentRepairsNotifyOnUnchangedPoll(t *testing.T) {
+	for _, cleanup := range []bool{false, true} {
+		name := "link"
+		if cleanup {
+			name = "cleanup"
+		}
+		t.Run(name, func(t *testing.T) {
+			database := openTestDB(t)
+			root := t.TempDir()
+			writeGroupedClaudeFixture(t, root, "queued-repair")
+			emitter := &fakeEmitter{}
+			engine := NewEngine(t.Context(), database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+				Machine:   "local", Emitter: emitter,
+			})
+			t.Cleanup(engine.Close)
+			require.Zero(t, engine.SyncAll(t.Context(), nil).Failed)
+			seedGroupedSubagentFixture(t, database)
+			if cleanup {
+				require.NoError(t, database.LinkSubagentSessions())
+				require.NoError(t, database.QueueSubagentParentCleanupRepairs(
+					t.Context(), []string{"grouped-child"},
+				))
+				_, err := database.DeleteParserExcludedSessions(t.Context(), []string{"grouped-parent"})
+				require.NoError(t, err)
+			} else {
+				require.NoError(t, database.QueueSubagentParentRepairs(
+					t.Context(), []string{"grouped-child"},
+				))
+			}
+			emitter.mu.Lock()
+			emitter.scopes = nil
+			emitter.mu.Unlock()
+
+			stats, _, err := engine.ReconcileWatchRootsWithStats(t.Context(), []string{root}, false, nil)
+			require.NoError(t, err)
+			child, err := database.GetSession(t.Context(), "grouped-child")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			if cleanup {
+				assert.Nil(t, child.ParentSessionID)
+			} else {
+				assert.Equal(t, new("grouped-parent"), child.ParentSessionID)
+			}
+			require.Zero(t, stats.Synced, "the source did not change")
+			assert.Equal(t, 1, stats.LinksUpdated)
+			assert.Equal(t, []string{"sessions"}, emitter.got())
+
+			emitter.mu.Lock()
+			emitter.scopes = nil
+			emitter.mu.Unlock()
+			stats, _, err = engine.ReconcileWatchRootsWithStats(t.Context(), []string{root}, false, nil)
+			require.NoError(t, err)
+			assert.Zero(t, stats.LinksUpdated)
+			assert.Empty(t, emitter.got(), "completed repairs must not keep refreshing clients")
+		})
+	}
+}
+
+func TestScopedParentRepairsReachSyncResults(t *testing.T) {
+	for _, mode := range []string{"watcher", "plan", "single session"} {
+		t.Run(mode, func(t *testing.T) {
+			database := openTestDB(t)
+			root := t.TempDir()
+			path := filepath.Join(root, "project", "parent.jsonl")
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+			require.NoError(t, os.WriteFile(path, []byte(`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"start"},"cwd":"/tmp","sessionId":"parent"}
+{"type":"assistant","timestamp":"2024-01-01T10:01:00Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"spawn","name":"Agent","input":{"prompt":"child work"}}]}}
+{"type":"user","timestamp":"2024-01-01T10:02:00Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"spawn","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"child"}}
+`), 0o600))
+			emitter := &fakeEmitter{}
+			engine := NewEngine(t.Context(), database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+				Machine:   "local", Emitter: emitter,
+			})
+			t.Cleanup(engine.Close)
+			if mode == "single session" {
+				// The parent source is already fresh when the child arrives.
+				require.Zero(t, engine.SyncAll(t.Context(), nil).Failed)
+			}
+			require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+				ID: "agent-child", Agent: "claude", Project: "project", Machine: "local",
+			}))
+			emitter.mu.Lock()
+			emitter.scopes = nil
+			emitter.mu.Unlock()
+			switch mode {
+			case "watcher":
+				require.NoError(t, engine.SyncPathsContext(t.Context(), []string{path}))
+				assert.Equal(t, 1, engine.LastSyncStats().LinksUpdated)
+			case "plan":
+				plan, err := engine.PlanChangedPathsContext(t.Context(), []string{path})
+				require.NoError(t, err)
+				result, err := engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+				require.NoError(t, err)
+				assert.Equal(t, 1, result.Stats.LinksUpdated)
+			case "single session":
+				require.NoError(t, engine.SyncSingleSessionContext(t.Context(), "parent"))
+				assert.Contains(t, emitter.got(), "sessions")
+			}
+			child, err := database.GetSession(t.Context(), "agent-child")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			assert.Equal(t, new("parent"), child.ParentSessionID)
+		})
+	}
+}
+
 func TestPollingRetriesFailedLinkDespiteCachedSourceFailure(t *testing.T) {
 	database := openTestDB(t)
 	root := t.TempDir()

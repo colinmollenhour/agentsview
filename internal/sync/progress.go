@@ -85,8 +85,8 @@ type SyncStats struct {
 	// serialized because worker-process passes marshal SyncStats back to the
 	// daemon, which must still emit "sessions" for cwd-only changes.
 	CwdUpdated int `json:"cwd_updated,omitempty"`
-	// LinksUpdated counts parent-link repairs from a global subagent linking
-	// pass. A pending retry can update parent_session_id while the poll's
+	// LinksUpdated counts global, scoped, and queued parent-link repairs.
+	// A pending retry can update parent_session_id while the poll's
 	// sync stats and tombstone count stay zero. Workers carry the count back
 	// to the daemon so it can notify clients about link-only repairs.
 	LinksUpdated int `json:"links_updated,omitempty"`

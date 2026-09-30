@@ -1793,7 +1793,7 @@ func (e *Engine) applyChangedPathSyncLocked(
 			},
 		},
 	)
-	linkErr := affectedSessionIDs.link(ctx, e, stats)
+	linkErr := affectedSessionIDs.link(ctx, e, &stats)
 	if linkErr != nil {
 		stats.RecordFailed()
 	}
@@ -3625,9 +3625,10 @@ func (e *Engine) resyncBuildLocked(
 	// Wait until orphan restoration is complete so every queued session and
 	// copied spawn edge is present. A failed repair leaves hierarchy state
 	// uncertain and must abort before the replacement can be installed.
-	if err := newDB.RepairQueuedSubagentParentsContext(ctx, func(done, total int) {
+	repaired, err := newDB.RepairQueuedSubagentParentsContext(ctx, func(done, total int) {
 		e.reportSubagentRepairProgress(reportResyncProgress, done, total)
-	}); err != nil {
+	})
+	if err != nil {
 		log.Printf("resync: repair copied subagent parents: %v", err)
 		stats.Aborted = true
 		stats.Warnings = append(stats.Warnings,
@@ -3641,6 +3642,7 @@ func (e *Engine) resyncBuildLocked(
 		e.mu.Unlock()
 		return stats, err
 	}
+	stats.RecordLinksUpdated(repaired)
 
 	// Copy recall entries and their evidence from the quiesced old DB.
 	// The fresh DB is built from source files, which never contain
@@ -10856,9 +10858,12 @@ flush:
 			e.reportSubagentRepairProgress(onProgress, done, total)
 		}
 	}
-	if err := e.db.RepairQueuedSubagentParentsContext(postWriteCtx, repairProgress); err != nil {
+	repaired, err := e.db.RepairQueuedSubagentParentsContext(postWriteCtx, repairProgress)
+	if err != nil {
 		log.Printf("repair queued subagent parents: %v", err)
 		stats.RecordFailed()
+	} else {
+		stats.RecordLinksUpdated(repaired)
 	}
 
 	// PhaseDone is emitted by syncAllLocked after the DB-backed
@@ -20654,22 +20659,26 @@ func (e *Engine) processAndWriteSessionFile(
 				"reconcile fresh source baselines: %w", err,
 			)
 		}
-		if err := e.db.RepairQueuedSubagentParents(); err != nil {
+		repaired, err := e.db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+		if err != nil {
 			return false, sessionsChanged, fmt.Errorf(
 				"repair queued subagent parents: %w", err,
 			)
 		}
+		sessionsChanged = sessionsChanged || repaired > 0
 		// A previous write may have stored a new spawn edge but failed
 		// before its child could be durably queued. The requested session is
 		// still a bounded repair seed on the freshness path because its
 		// surviving edges identify those children directly.
-		if err := e.db.LinkSubagentSessionsForSessions(ctx,
+		linked, err := e.db.LinkSubagentSessionsForSessions(ctx,
 			[]string{requestedSessionID},
-		); err != nil {
+		)
+		if err != nil {
 			return false, sessionsChanged, fmt.Errorf(
 				"link fresh subagent sessions: %w", err,
 			)
 		}
+		sessionsChanged = sessionsChanged || linked > 0
 		return false, sessionsChanged, nil
 	}
 	if res.cacheSkip {
@@ -20701,11 +20710,13 @@ func (e *Engine) processAndWriteSessionFile(
 	// A prior sync may have removed an edge and then failed before repairing
 	// its child. Retry that durable work after this sync's read-only capture
 	// but before making any new mutations.
-	if err := e.db.RepairQueuedSubagentParents(); err != nil {
+	repaired, err := e.db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+	if err != nil {
 		return false, sessionsChanged, fmt.Errorf(
 			"repair queued subagent parents: %w", err,
 		)
 	}
+	sessionsChanged = sessionsChanged || repaired > 0
 	if err := e.db.QueueSubagentParentCleanupRepairs(ctx, priorChildren); err != nil {
 		return false, sessionsChanged, fmt.Errorf(
 			"queue subagent parent repairs: %w", err,
@@ -20736,11 +20747,13 @@ func (e *Engine) processAndWriteSessionFile(
 		if !repairQueued {
 			return
 		}
-		if repairErr := e.db.RepairQueuedSubagentParents(); repairErr != nil {
+		repaired, repairErr := e.db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+		if repairErr != nil {
 			err = errors.Join(err, fmt.Errorf(
 				"repair queued subagent parents: %w", repairErr,
 			))
 		}
+		sessionsChanged = sessionsChanged || repaired > 0
 	}()
 	queueWrittenChildren := func(spawnerIDs []string) error {
 		children, childErr := e.db.SubagentChildSessionIDs(ctx, spawnerIDs)
@@ -20826,12 +20839,14 @@ func (e *Engine) processAndWriteSessionFile(
 		); err != nil {
 			return false, sessionsChanged, err
 		}
-		if err := e.db.LinkSubagentSessionsForSessions(ctx,
+		linked, err := e.db.LinkSubagentSessionsForSessions(ctx,
 			[]string{res.incremental.sessionID},
-		); err != nil {
+		)
+		if err != nil {
 			return false, sessionsChanged, fmt.Errorf(
 				"link incremental subagent sessions: %w", err)
 		}
+		sessionsChanged = sessionsChanged || linked > 0
 		return false, sessionsChanged, nil
 	}
 
@@ -20925,12 +20940,14 @@ func (e *Engine) processAndWriteSessionFile(
 	if !sourceComplete {
 		markSourceIncomplete()
 	}
-	if err := e.db.LinkSubagentSessionsForSessions(ctx, resultIDs); err != nil {
+	linked, err := e.db.LinkSubagentSessionsForSessions(ctx, resultIDs)
+	if err != nil {
 		markSourceIncomplete()
 		return false, sessionsChanged, fmt.Errorf(
 			"link changed subagent sessions: %w", err,
 		)
 	}
+	sessionsChanged = sessionsChanged || linked > 0
 	if sourceComplete && atomicDAG {
 		if err := e.db.SetSessionDataVersions(
 			writtenIDs, db.CurrentDataVersion(),

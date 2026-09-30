@@ -2065,19 +2065,26 @@ func clearDanglingSubagentParentQuery(ph string) string {
 // on every change — must use this form so their linking cost tracks the
 // changed batch; bulk paths (full sync, reconciliation, resync) keep the
 // global LinkSubagentSessions pass they already coalesce to.
-func (db *DB) LinkSubagentSessionsForSessions(ctx context.Context, ids []string) error {
+// The returned count includes only committed changes; all chunks commit together.
+func (db *DB) LinkSubagentSessionsForSessions(ctx context.Context, ids []string) (int, error) {
 	if len(ids) == 0 {
-		return nil
+		return 0, nil
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning scoped subagent linking: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	updated := 0
 
 	// Each id binds twice (once per UNION branch), so halve the chunk to
 	// stay within SQLite's bind-variable limit.
-	return queryChunkedSize(ids, maxSQLVars/2, func(chunk []string) error {
+	err = queryChunkedSize(ids, maxSQLVars/2, func(chunk []string) error {
 		ph, args := inPlaceholders(chunk)
 		allArgs := append(append([]any{}, args...), args...)
-		_, err := db.getWriter().Exec(ctx,
+		res, err := tx.ExecContext(ctx,
 			linkSubagentSessionsForSessionsQuery(ph), allArgs...,
 		)
 		if err != nil {
@@ -2086,8 +2093,20 @@ func (db *DB) LinkSubagentSessionsForSessions(ctx context.Context, ids []string)
 				len(chunk), err,
 			)
 		}
+		count, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("counting scoped subagent links: %w", err)
+		}
+		updated += int(count)
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing scoped subagent linking: %w", err)
+	}
+	return updated, nil
 }
 
 // QueueSubagentParentRepairs durably records sessions whose hierarchy must be
@@ -2164,7 +2183,8 @@ func (db *DB) queueSubagentParentRepairs(ctx context.Context, ids []string, clea
 // back both the hierarchy changes and queue deletion so a later sync retries
 // the exact IDs even when their original spawn edges have disappeared.
 func (db *DB) RepairQueuedSubagentParents() error {
-	return db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+	_, err := db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+	return err
 }
 
 // RepairQueuedSubagentParentsContext is RepairQueuedSubagentParents with
@@ -2172,9 +2192,10 @@ func (db *DB) RepairQueuedSubagentParents() error {
 // checked queue entries, including missing sessions and unchanged parents. The
 // final callback precedes commit; an error still rolls back the entire repair.
 // The callback runs under the writer lock and must not call back into DB.
+// The returned count includes session rows changed by committed linking and cleanup.
 func (db *DB) RepairQueuedSubagentParentsContext(
 	ctx context.Context, onProgress func(done, total int),
-) error {
+) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -2186,19 +2207,20 @@ func (db *DB) RepairQueuedSubagentParentsContext(
 		subagentParentRepairQueueStateKey,
 	).Scan(&pending)
 	if err != nil {
-		return fmt.Errorf("checking subagent parent repair queue: %w", err)
+		return 0, fmt.Errorf("checking subagent parent repair queue: %w", err)
 	}
 	if pending == 0 {
-		return nil
+		return 0, nil
 	}
 	tx, err := db.getWriter().BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("beginning queued subagent parent repair: %w", err)
+		return 0, fmt.Errorf("beginning queued subagent parent repair: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	if err := migrateLegacySubagentParentRepairQueueTx(ctx, tx); err != nil {
-		return err
+		return 0, err
 	}
+	updated := 0
 	var done, total int
 	if onProgress != nil {
 		if err := tx.QueryRowContext(ctx, `
@@ -2207,7 +2229,7 @@ func (db *DB) RepairQueuedSubagentParentsContext(
 				UNION
 				SELECT session_id FROM subagent_parent_cleanup_queue
 			)`).Scan(&total); err != nil {
-			return fmt.Errorf("counting queued subagent parent repairs: %w", err)
+			return 0, fmt.Errorf("counting queued subagent parent repairs: %w", err)
 		}
 		if total > 0 {
 			onProgress(0, total)
@@ -2241,7 +2263,7 @@ func (db *DB) RepairQueuedSubagentParentsContext(
 			return ids, nil
 		}()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if len(ids) == 0 {
 			break
@@ -2250,30 +2272,42 @@ func (db *DB) RepairQueuedSubagentParentsContext(
 		chunk := ids
 		ph, args := inPlaceholders(chunk)
 		allArgs := append(append([]any{}, args...), args...)
-		if _, err := tx.ExecContext(ctx,
+		res, err := tx.ExecContext(ctx,
 			linkSubagentSessionsForSessionsQuery(ph), allArgs...,
-		); err != nil {
-			return fmt.Errorf(
+		)
+		if err != nil {
+			return 0, fmt.Errorf(
 				"linking queued subagent parents for %d sessions: %w",
 				len(chunk), err,
 			)
 		}
+		linked, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("counting queued subagent links: %w", err)
+		}
+		updated += int(linked)
 		cleanupSeeds := `(SELECT session_id
 			FROM subagent_parent_cleanup_queue WHERE session_id IN ` + ph + `)`
-		if _, err := tx.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			clearDanglingSubagentParentQuery(cleanupSeeds), args...,
-		); err != nil {
-			return fmt.Errorf(
+		)
+		if err != nil {
+			return 0, fmt.Errorf(
 				"clearing queued dangling subagent parents for %d "+
 					"sessions: %w",
 				len(chunk), err,
 			)
 		}
+		cleared, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("counting queued dangling-parent repairs: %w", err)
+		}
+		updated += int(cleared)
 		if _, err := tx.ExecContext(ctx,
 			"DELETE FROM subagent_parent_cleanup_queue WHERE session_id IN "+ph,
 			args...,
 		); err != nil {
-			return fmt.Errorf(
+			return 0, fmt.Errorf(
 				"clearing %d queued subagent parent cleanups: %w",
 				len(chunk), err,
 			)
@@ -2282,7 +2316,7 @@ func (db *DB) RepairQueuedSubagentParentsContext(
 			"DELETE FROM subagent_parent_repair_queue WHERE session_id IN "+ph,
 			args...,
 		); err != nil {
-			return fmt.Errorf(
+			return 0, fmt.Errorf(
 				"clearing %d queued subagent parent repairs: %w",
 				len(chunk), err,
 			)
@@ -2293,9 +2327,9 @@ func (db *DB) RepairQueuedSubagentParentsContext(
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing queued subagent parent repair: %w", err)
+		return 0, fmt.Errorf("committing queued subagent parent repair: %w", err)
 	}
-	return nil
+	return updated, nil
 }
 
 func migrateLegacySubagentParentRepairQueueTx(

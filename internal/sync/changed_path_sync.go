@@ -162,7 +162,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 			},
 		},
 	)
-	if err := affectedSessionIDs.link(ctx, e, stats); err != nil {
+	if err := affectedSessionIDs.link(ctx, e, &stats); err != nil {
 		stats.RecordFailed()
 		processErr = errors.Join(processErr, err)
 	}
