@@ -239,6 +239,7 @@ triggering global parent linking. Worker processes return link repairs and
 unfinished linking to the daemon, so clients see repaired links and later polls
 retry failed linking even when an unrelated source cannot be processed. If a
 started worker loses its result, the daemon keeps a link retry pending. Repairs
+queued in the archive run even when discovery finds no source files. Repairs
 committed to the live archive refresh clients even if sync is canceled. Full
 resync aborts before replacing the archive if relinking copied sessions fails;
 discarded replacements do not report their repairs.

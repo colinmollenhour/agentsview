@@ -294,6 +294,78 @@ func TestCanceledSyncThenRunNotifiesCommittedParentRepair(t *testing.T) {
 	assert.Equal(t, []string{"sync"}, emitter.got())
 }
 
+func TestEmptyReconciliationRetriesQueuedParentCleanup(t *testing.T) {
+	for _, mode := range []string{"partial", "full", "grouped"} {
+		t.Run(mode, func(t *testing.T) {
+			database := openTestDB(t)
+			root := t.TempDir()
+			seedGroupedSubagentFixture(t, database)
+			require.NoError(t, database.LinkSubagentSessions())
+			require.NoError(t, database.QueueSubagentParentCleanupRepairs(
+				t.Context(), []string{"grouped-child"},
+			))
+			_, err := database.DeleteParserExcludedSessions(t.Context(), []string{"grouped-parent"})
+			require.NoError(t, err)
+			emitter := &fakeEmitter{}
+			engine := NewEngine(t.Context(), database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+				Machine:   "local", Emitter: emitter,
+			})
+			t.Cleanup(engine.Close)
+			metrics := &reconciliationRuntimeMetrics{}
+			ctx := context.WithValue(t.Context(), reconciliationMetricsContextKey{}, metrics)
+			reconcile := func() (SyncStats, error) {
+				if mode == "grouped" {
+					return SyncStats{}, engine.ReconcileProviderRootsGrouped(ctx, []ProviderRootsGroup{
+						{Agent: parser.AgentClaude, Roots: []string{root}},
+					})
+				}
+				stats, _, err := engine.ReconcileWatchRootsWithStats(ctx, []string{root}, mode == "full", nil)
+				return stats, err
+			}
+			raw, err := sql.Open("sqlite3", database.Path())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, raw.Close()) })
+			_, err = raw.ExecContext(ctx, `CREATE TRIGGER fail_empty_poll_cleanup
+				BEFORE UPDATE OF parent_session_id ON sessions WHEN NEW.id = 'grouped-child'
+				BEGIN SELECT RAISE(FAIL, 'injected queued cleanup failure'); END`)
+			require.NoError(t, err)
+
+			_, err = reconcile()
+			require.ErrorContains(t, err, "injected queued cleanup failure")
+			requireGroupedChildParent(t, database, true, "failed cleanup must preserve the stored parent")
+			var queued int
+			require.NoError(t, raw.QueryRowContext(ctx, "SELECT count(*) FROM subagent_parent_cleanup_queue").Scan(&queued))
+			require.Equal(t, 1, queued, "failed cleanup must remain queued")
+			assert.Empty(t, emitter.got())
+			_, err = raw.ExecContext(ctx, "DROP TRIGGER fail_empty_poll_cleanup")
+			require.NoError(t, err)
+
+			stats, err := reconcile()
+			require.NoError(t, err)
+			requireGroupedChildParent(t, database, false, "an empty poll must retry the queued cleanup")
+			if mode != "grouped" {
+				assert.Equal(t, 1, stats.LinksUpdated)
+			}
+			assert.Equal(t, []string{"sessions"}, emitter.got())
+			require.NoError(t, raw.QueryRowContext(ctx, "SELECT count(*) FROM subagent_parent_cleanup_queue").Scan(&queued))
+			assert.Zero(t, queued)
+			stats, err = reconcile()
+			require.NoError(t, err)
+			if mode != "grouped" {
+				assert.Zero(t, stats.LinksUpdated)
+			}
+			assert.Equal(t, []string{"sessions"}, emitter.got(), "completed cleanup must not repeat notifications")
+			switch mode {
+			case "partial":
+				assert.Zero(t, engine.LastReconciliationResult().Metrics.GlobalLinkPasses)
+			case "grouped":
+				assert.Zero(t, metrics.snapshot(ReconciliationMetrics{}).GlobalLinkPasses)
+			}
+		})
+	}
+}
+
 func TestPendingParentRepairSurvivesUnreadableSource(t *testing.T) {
 	for _, grouped := range []bool{false, true} {
 		name := "single provider"

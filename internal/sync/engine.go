@@ -70,20 +70,21 @@ type (
 )
 
 // passEpilogueDeferred reports whether a grouped caller owns the pass
-// epilogue — global subagent linking and skip-cache persistence — so a
-// scoped reconciliation must not repeat that archive-sized work itself.
+// epilogue — queued parent repairs, global linking, and skip-cache persistence —
+// so a scoped reconciliation must not repeat that work itself.
 func passEpilogueDeferred(ctx context.Context) bool {
 	deferred, _ := ctx.Value(deferPassEpilogueContextKey{}).(bool)
 	return deferred
 }
 
 // passEpilogueEligibility records, at the per-pass gate sites, whether a
-// pass would have run global subagent linking and skip-cache persistence.
+// pass would have run queued repairs, global linking, and skip-cache persistence.
 // Grouped callers consume it instead of inferring eligibility from the
 // pass's final error: that error also reflects later tombstoning and spool
 // cleanup failures, which never suppressed the per-pass epilogue and must
 // not suppress the shared one.
 type passEpilogueEligibility struct {
+	repair  bool
 	link    bool
 	persist bool
 }
@@ -4964,9 +4965,9 @@ type ProviderRootsGroup struct {
 }
 
 // ReconcileProviderRootsGrouped runs the bounded scheduled pass for every
-// group and shares one pass epilogue — global subagent linking and skip-cache
-// persistence — across the whole batch, so a multi-provider poll performs
-// that archive-sized work once instead of once per provider. Every group is
+// group and shares one pass epilogue — queued repairs, global linking, and
+// skip-cache persistence — across the whole batch. A multi-provider poll performs
+// global linking once instead of once per provider. Every group is
 // attempted even when an earlier one fails; per-group failures are wrapped
 // with the provider and joined.
 //
@@ -4991,6 +4992,7 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 		e.syncMu.Lock()
 		defer e.syncMu.Unlock()
 		defer e.clearCurrentProgress()
+		repairEligible := false
 		linkEligible := false
 		persistEligible := false
 		for _, group := range groups {
@@ -5001,6 +5003,7 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 				deferredCtx, group.Agent, group.Roots, false, false, nil,
 			)
 			changed = changed || stats.hasSessionChanges() || tombstoned > 0
+			repairEligible = repairEligible || eligibility.repair
 			linkEligible = linkEligible || eligibility.link
 			persistEligible = persistEligible || eligibility.persist
 			if err == nil {
@@ -5032,6 +5035,16 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 			} else if linked > 0 {
 				// The repair runs after per-group stats are folded into
 				// changed. A parent-only update still has to refresh clients.
+				changed = true
+			}
+		}
+		if repairEligible {
+			repaired, err := e.db.RepairQueuedSubagentParentsContext(ctx, nil)
+			if err != nil {
+				errs = append(errs, fmt.Errorf(
+					"repair queued subagent parents after grouped reconciliation: %w", err,
+				))
+			} else if repaired > 0 {
 				changed = true
 			}
 		}
@@ -5504,6 +5517,7 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 	// once after all groups, and tombstoning keeps its separate success gate.
 	e.subagentLinkPending = e.subagentLinkPending || stats.Synced > 0
 	if ctx.Err() == nil {
+		eligibility.repair = true
 		eligibility.link = e.subagentLinkPending ||
 			(fullCoverage && retErr == nil && stats.Failed == 0 && !stats.Aborted)
 	}
@@ -5522,6 +5536,20 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 			// the repair into that sample would keep the next unchanged
 			// poll on the global link path.
 			stats.RecordLinksUpdated(linked)
+		}
+	}
+	// An empty spool never enters collectAndBatch, so its pending durable
+	// repairs must run here too. This touches queued IDs, not the full archive.
+	if eligibility.repair && !passEpilogueDeferred(ctx) {
+		repaired, err := e.db.RepairQueuedSubagentParentsContext(ctx, nil)
+		if err != nil {
+			stats.RecordFailed()
+			stats.Aborted = true
+			retErr = errors.Join(retErr, fmt.Errorf(
+				"repair queued subagent parents after reconciliation: %w", err,
+			))
+		} else {
+			stats.RecordLinksUpdated(repaired)
 		}
 	}
 	canTombstoneCompletedScopes :=
