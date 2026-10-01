@@ -2952,7 +2952,7 @@ func (e *Engine) resyncAllWithOptionsLocked(
 	if swapErr != nil {
 		if !installed {
 			// The original archive is still in place; drop the discarded
-			// replacement's skip entries and its tombstone count. A
+			// replacement's skip entries and its change counts. A
 			// post-install failure keeps both: the replacement is the live
 			// archive there.
 			e.skipMu.Lock()
@@ -2961,6 +2961,7 @@ func (e *Engine) resyncAllWithOptionsLocked(
 			e.skipHashKeys = preBuildSkipHashKeys
 			e.skipMu.Unlock()
 			stats.Tombstoned = 0
+			stats.LinksUpdated = 0
 		}
 		e.setLastSyncStats(stats)
 		return stats, swapErr
@@ -2984,11 +2985,11 @@ func (e *Engine) resyncBuildLocked(
 ) (stats SyncStats, retErr error) {
 	e.clearPiebaldFailureMemo()
 	defer e.clearPiebaldFailureMemo()
-	// Rebuild tombstones are committed only inside the replacement, and every
+	// Rebuild tombstones and links commit only inside the replacement, and every
 	// aborted or failed build discards it. Hold them here and publish the
 	// count only on the successful return, so no failure branch stores or
 	// returns removals that never reached the archive.
-	pendingTombstoned := 0
+	var pendingTombstoned, pendingLinksUpdated int
 	reportResyncProgress := func(p Progress) {
 		p.Resync = true
 		if p.Phase == PhaseSyncing && p.Detail == "" {
@@ -3293,6 +3294,8 @@ func (e *Engine) resyncBuildLocked(
 	e.archiveStaleClaudeForks = nil
 	pendingTombstoned += stats.Tombstoned
 	stats.Tombstoned = 0
+	pendingLinksUpdated += stats.LinksUpdated
+	stats.LinksUpdated = 0
 	e.phaseStats.Log("resync")
 	if opts.includePhaseDiagnostics {
 		stats.RebuildPhases = append(stats.RebuildPhases,
@@ -3358,6 +3361,8 @@ func (e *Engine) resyncBuildLocked(
 		mergeSyncStats(&stats, contributorStats)
 		pendingTombstoned += stats.Tombstoned
 		stats.Tombstoned = 0
+		pendingLinksUpdated += stats.LinksUpdated
+		stats.LinksUpdated = 0
 		if opts.includePhaseDiagnostics {
 			stats.RebuildPhases = append(stats.RebuildPhases, phase)
 		}
@@ -3609,15 +3614,15 @@ func (e *Engine) resyncBuildLocked(
 
 	// Re-link subagent sessions after orphan copy so copied
 	// tool_calls.subagent_session_id references are resolved.
+	var repaired int
 	if len(orphaned) > 0 {
 		reportResyncPhase(
 			PhaseCopyingOrphans,
 			"Relinking archived subagent sessions",
 			"",
 		)
-		if err := newDB.LinkSubagentSessions(); err != nil {
-			log.Printf("resync: relink subagent sessions: %v", err)
-		}
+		repaired, err = newDB.LinkSubagentSessionsContext(ctx)
+		pendingLinksUpdated += repaired
 	}
 
 	// CopySyncStateFrom runs after the fresh archive's normal linking pass so
@@ -3625,9 +3630,12 @@ func (e *Engine) resyncBuildLocked(
 	// Wait until orphan restoration is complete so every queued session and
 	// copied spawn edge is present. A failed repair leaves hierarchy state
 	// uncertain and must abort before the replacement can be installed.
-	repaired, err := newDB.RepairQueuedSubagentParentsContext(ctx, func(done, total int) {
-		e.reportSubagentRepairProgress(reportResyncProgress, done, total)
-	})
+	if err == nil {
+		repaired, err = newDB.RepairQueuedSubagentParentsContext(ctx, func(done, total int) {
+			e.reportSubagentRepairProgress(reportResyncProgress, done, total)
+		})
+		pendingLinksUpdated += repaired
+	}
 	if err != nil {
 		log.Printf("resync: repair copied subagent parents: %v", err)
 		stats.Aborted = true
@@ -3642,7 +3650,6 @@ func (e *Engine) resyncBuildLocked(
 		e.mu.Unlock()
 		return stats, err
 	}
-	stats.RecordLinksUpdated(repaired)
 
 	// Copy recall entries and their evidence from the quiesced old DB.
 	// The fresh DB is built from source files, which never contain
@@ -3920,6 +3927,7 @@ func (e *Engine) resyncBuildLocked(
 		return stats, err
 	}
 	stats.Tombstoned = pendingTombstoned
+	stats.LinksUpdated = pendingLinksUpdated
 	return stats, nil
 }
 
@@ -5490,33 +5498,25 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 		e.promoteSkipCacheWrites(eligibleCacheWrites)
 		cursor = page[len(page)-1].Cursor()
 	}
-	// Page writes committed cleanly when the paging loop finished without an
-	// error or a failed write; provider discovery failures are layered on
-	// below and must not suppress work that only depends on committed writes.
-	// A grouped caller (passEpilogueDeferred) runs linking once after every
-	// group instead, consuming the eligibility recorded here; tombstoning
-	// below then proceeds without the linking gate, which is safe because
-	// linking is idempotent and retried on the caller's next pass.
+	// Pending linking depends only on committed archive rows. Unrelated source
+	// failures must not suppress it; full reconciliation without pending work
+	// still requires a completed pass. Grouped callers consume this eligibility
+	// once after all groups, and tombstoning keeps its separate success gate.
 	e.subagentLinkPending = e.subagentLinkPending || stats.Synced > 0
-	if retErr == nil && stats.Failed == 0 && !stats.Aborted {
-		eligibility.link = fullCoverage || e.subagentLinkPending
+	if ctx.Err() == nil {
+		eligibility.link = e.subagentLinkPending ||
+			(fullCoverage && retErr == nil && stats.Failed == 0 && !stats.Aborted)
 	}
 	if eligibility.link && !passEpilogueDeferred(ctx) {
-		// Batch-level linking was deferred to this global pass, so run it
-		// whenever the committed page writes succeeded — including partial
-		// provider failures. Sessions from healthy providers are already in
-		// the archive, and a permanently failing unrelated provider must not
-		// leave their subagent relationships missing indefinitely. Linking
-		// runs before the incomplete-reconciliation error is built: a
-		// linking failure blocks the completed scopes' tombstoning below, so
-		// those scopes must join the retry roots rather than staying stale.
+		// Keep earlier processing errors so failed work still blocks tombstoning
+		// and retains its retry roots even when the pending links are repaired.
 		linked, err := e.linkSubagentSessions(ctx)
 		if err != nil {
 			stats.RecordFailed()
 			stats.Aborted = true
-			retErr = fmt.Errorf(
+			retErr = errors.Join(retErr, fmt.Errorf(
 				"link subagent sessions after reconciliation: %w", err,
-			)
+			))
 		} else {
 			// Record after subagentLinkPending is sampled above. Folding
 			// the repair into that sample would keep the next unchanged

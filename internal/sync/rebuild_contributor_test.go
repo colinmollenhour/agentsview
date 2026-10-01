@@ -1209,6 +1209,7 @@ func TestResyncBuildFailureDoesNotReportDiscardedTombstones(t *testing.T) {
 	})
 	t.Cleanup(engine.Close)
 	staleID := seedRebuildStaleForkFixture(t, root, database)
+	seedGroupedSubagentFixture(t, database)
 
 	sentinel := errors.New("fts sentinel")
 	stats, err := engine.resyncAllWithOptionsAndOperations(
@@ -1222,6 +1223,9 @@ func TestResyncBuildFailureDoesNotReportDiscardedTombstones(t *testing.T) {
 		"tombstones in a discarded replacement must not be reported")
 	assert.Zero(t, engine.LastSyncStats().Tombstoned,
 		"recorded failure stats must not carry discarded tombstones")
+	assert.Zero(t, stats.LinksUpdated, "repairs in a discarded replacement must not be reported")
+	assert.Zero(t, engine.LastSyncStats().LinksUpdated)
+	requireGroupedChildParent(t, database, false, "the original archive must remain unchanged")
 	assert.Empty(t, emitter.got(),
 		"a discarded replacement must not publish a sync event")
 	stale, err := database.GetSession(t.Context(), staleID)
@@ -1244,6 +1248,7 @@ func TestResyncPreInstallSwapFailureDoesNotReportDiscardedTombstones(
 	})
 	t.Cleanup(engine.Close)
 	staleID := seedRebuildStaleForkFixture(t, root, database)
+	seedGroupedSubagentFixture(t, database)
 
 	restore := db.SetCloseDrainTimeoutForTest(100 * time.Millisecond)
 	defer restore()
@@ -1267,6 +1272,9 @@ func TestResyncPreInstallSwapFailureDoesNotReportDiscardedTombstones(
 		"tombstones in a discarded replacement must not be reported")
 	assert.Zero(t, engine.LastSyncStats().Tombstoned,
 		"recorded failure stats must not carry discarded tombstones")
+	assert.Zero(t, stats.LinksUpdated, "repairs in a discarded replacement must not be reported")
+	assert.Zero(t, engine.LastSyncStats().LinksUpdated)
+	requireGroupedChildParent(t, database, false, "the original archive must remain unchanged")
 	assert.Empty(t, emitter.got(),
 		"a discarded replacement must not publish a sync event")
 	stale, err := database.GetSession(t.Context(), staleID)
@@ -1358,4 +1366,62 @@ func TestResyncUsageIndexRebuildFailureAbortsSwap(t *testing.T) {
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix)
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-wal")
 	assert.NoFileExists(t, database.Path()+resyncTempSuffix+"-shm")
+}
+
+func TestResyncOrphanRelinkCountsAndAbortsOnFailure(t *testing.T) {
+	for _, injectFailure := range []bool{false, true} {
+		name := "success_count"
+		if injectFailure {
+			name = "failed_link_swap"
+		}
+		t.Run(name, func(t *testing.T) {
+			engine, database, _ := newResyncSplitEngine(t)
+			require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+				ID: "archived-parent", Agent: "claude", Project: "project", Machine: "local", MessageCount: 1,
+			}))
+			require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+				SessionID: "archived-parent", Ordinal: 0, Role: "assistant", Content: "spawn child", HasToolUse: true,
+				ToolCalls: []db.ToolCall{{ToolUseID: "spawn", ToolName: "Task", SubagentSessionID: "keep0"}},
+			}}))
+			require.NoError(t, database.LinkSubagentSessions())
+			before, err := database.GetSession(t.Context(), "keep0")
+			require.NoError(t, err)
+			require.Equal(t, new("archived-parent"), before.ParentSessionID)
+			opts := RebuildOptions{}
+			if injectFailure {
+				opts.Contributors = []RebuildContributor{{
+					Name: "link-failure-fixture", Config: EngineConfig{
+						AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {t.TempDir()}},
+						Machine:   "fixture", IDPrefix: "fixture~", Ephemeral: true,
+					},
+					AfterSync: func(_ *Engine, tempDB *db.DB) error {
+						return tempDB.Update(t.Context(), func(tx *sql.Tx) error {
+							_, err := tx.ExecContext(t.Context(), `CREATE TRIGGER fail_orphan_link
+        BEFORE UPDATE OF parent_session_id ON sessions
+        WHEN NEW.id='keep0' AND NEW.parent_session_id='archived-parent'
+        BEGIN SELECT RAISE(FAIL,'injected orphan-link failure'); END`)
+							return err
+						})
+					},
+				}}
+			}
+			stats, err := engine.ResyncAllWithOptions(t.Context(), nil, opts)
+			if injectFailure {
+				require.ErrorContains(t, err, "injected orphan-link failure")
+				assert.True(t, stats.Aborted)
+				assert.False(t, stats.ArchiveRebuilt)
+				assert.Zero(t, stats.LinksUpdated, "discarded repairs must not be reported")
+			} else {
+				require.NoError(t, err)
+				assert.False(t, stats.Aborted)
+				assert.True(t, stats.ArchiveRebuilt)
+				assert.Equal(t, 1, stats.LinksUpdated)
+			}
+			child, err := database.GetSession(t.Context(), "keep0")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			assert.Equal(t, new("archived-parent"), child.ParentSessionID,
+				"a failed replacement must preserve the original archive's correct link")
+		})
+	}
 }

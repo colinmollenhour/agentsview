@@ -1194,7 +1194,7 @@ func TestRunWorkerResyncBuildDropsTombstonesWhenSwapFailsBeforeInstall(
 		// the daemon's swap fails at the rename with the original intact.
 		return workerResult{
 			Status: "ok", DiscoveryComplete: true, Tombstoned: 1,
-			Stats: &sync.SyncStats{Tombstoned: 1},
+			Stats: &sync.SyncStats{Tombstoned: 1, LinksUpdated: 1},
 		}, nil
 	})
 	defer restore()
@@ -1209,6 +1209,59 @@ func TestRunWorkerResyncBuildDropsTombstonesWhenSwapFailsBeforeInstall(
 	require.NotNil(t, result.Stats)
 	assert.Zero(t, result.Stats.Tombstoned,
 		"the worker stats payload must not carry discarded tombstones")
+	assert.Zero(t, result.Stats.LinksUpdated,
+		"the worker stats payload must not carry discarded parent repairs")
 	assert.NoError(t, writeOneSession(t.Context(), database),
 		"writes must recover without a daemon restart")
+}
+
+func TestWorkerResyncNotifiesInstalledRepairAfterCancellation(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, _ := openTestWriteDB(t, cfg)
+	em := &scopedEmitter{scopes: make(chan string, 8)}
+	engineCfg := workerEngineConfig(cfg)
+	engineCfg.Emitter = em
+	engine := sync.NewEngine(t.Context(), database, engineCfg)
+	defer engine.Close()
+	require.Equal(t, 3, engine.SyncAll(t.Context(), nil).Synced)
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID: "archived-parent", Agent: "claude", Project: "project", Machine: "local", MessageCount: 1,
+	}))
+	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+		SessionID: "archived-parent", Ordinal: 0, Role: "assistant", Content: "spawn", HasToolUse: true,
+		ToolCalls: []db.ToolCall{{ToolName: "Task", ToolUseID: "spawn", SubagentSessionID: "session0"}},
+	}}))
+	before, err := database.GetSession(t.Context(), "session0")
+	require.NoError(t, err)
+	require.Nil(t, before.ParentSessionID)
+	for len(em.scopes) > 0 {
+		<-em.scopes
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	restore := stubLaunchSyncWorker(t, func(
+		_ context.Context, c config.Config, mode string, _ func(workerLine),
+	) (workerResult, error) {
+		var result workerResult
+		err := runSyncWorkerResyncBuild(t.Context(), c, mode, func(line workerLine) {
+			if line.Result != nil {
+				result = *line.Result
+			}
+		}, func(sync.Progress) {})
+		require.NoError(t, err)
+		require.Equal(t, 1, result.Stats.LinksUpdated)
+		cancel()
+		return result, nil
+	})
+	defer restore()
+	result, err, spawnFailed := runWorkerResyncBuild(ctx, t.Context(), cfg, engine, database, nil)
+	require.False(t, spawnFailed)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "reloading skip cache after swap")
+	require.Equal(t, 1, result.Stats.LinksUpdated)
+	after, err := database.GetSession(t.Context(), "session0")
+	require.NoError(t, err)
+	require.Equal(t, new("archived-parent"), after.ParentSessionID)
+	require.Len(t, em.scopes, 1)
+	require.Equal(t, "sync", <-em.scopes)
 }

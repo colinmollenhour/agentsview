@@ -254,6 +254,117 @@ func TestQueuedParentRepairsNotifyOnUnchangedPoll(t *testing.T) {
 	}
 }
 
+func TestCanceledSyncThenRunNotifiesCommittedParentRepair(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	writeGroupedClaudeFixture(t, root, "unchanged")
+	emitter := &fakeEmitter{}
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		Machine:   "local", Emitter: emitter,
+	})
+	t.Cleanup(engine.Close)
+	require.Zero(t, engine.SyncAll(t.Context(), nil).Failed)
+	seedGroupedSubagentFixture(t, database)
+	require.NoError(t, database.LinkSubagentSessions())
+	require.NoError(t, database.QueueSubagentParentCleanupRepairs(t.Context(), []string{"grouped-child"}))
+	_, err := database.DeleteParserExcludedSessions(t.Context(), []string{"grouped-parent"})
+	require.NoError(t, err)
+	emitter.mu.Lock()
+	emitter.scopes = nil
+	emitter.mu.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stats, err := engine.SyncThenRun(ctx, false, func(p Progress) {
+		if p.Phase == PhaseSyncing {
+			cancel()
+		}
+	}, func(bool) error {
+		require.FailNow(t, "canceled sync must not start the follow-up work")
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.True(t, stats.Aborted)
+	require.Zero(t, stats.Synced)
+	assert.Equal(t, 1, stats.LinksUpdated)
+	child, err := database.GetSession(t.Context(), "grouped-child")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	assert.Nil(t, child.ParentSessionID, "queued cleanup committed despite cancellation")
+	assert.Equal(t, []string{"sync"}, emitter.got())
+}
+
+func TestPendingParentRepairSurvivesUnreadableSource(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		name := "single provider"
+		if grouped {
+			name = "grouped"
+		}
+		t.Run(name, func(t *testing.T) {
+			database := openTestDB(t)
+			root := t.TempDir()
+			writeGroupedClaudeFixture(t, root, "polled-link-retry")
+			seedGroupedSubagentFixture(t, database)
+			emitter := &fakeEmitter{}
+			engine := NewEngine(t.Context(), database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+				Machine:   "local", Emitter: emitter,
+			})
+			t.Cleanup(engine.Close)
+			raw, err := sql.Open("sqlite3", database.Path())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, raw.Close()) })
+			_, err = raw.ExecContext(t.Context(), `CREATE TRIGGER fail_polled_link
+				BEFORE UPDATE OF parent_session_id ON sessions WHEN NEW.id = 'grouped-child'
+				BEGIN SELECT RAISE(FAIL, 'injected poll link failure'); END`)
+			require.NoError(t, err)
+			reconcile := func(ctx context.Context) error {
+				if grouped {
+					return engine.ReconcileProviderRootsGrouped(ctx, []ProviderRootsGroup{
+						{Agent: parser.AgentClaude, Roots: []string{root}},
+					})
+				}
+				return engine.ReconcileProviderRoots(ctx, parser.AgentClaude, []string{root})
+			}
+			require.ErrorContains(t, reconcile(t.Context()), "injected poll link failure")
+			requireGroupedChildParent(t, database, false, "failed linking must leave a retry")
+			_, err = raw.ExecContext(t.Context(), "DROP TRIGGER fail_polled_link")
+			require.NoError(t, err)
+			writeGroupedClaudeFixture(t, root, "unreadable")
+			unreadable := filepath.Join(root, "project", "unreadable.jsonl")
+			require.NoError(t, os.Chmod(unreadable, 0))
+			t.Cleanup(func() { require.NoError(t, os.Chmod(unreadable, 0o600)) })
+			file, err := os.Open(unreadable)
+			if err == nil {
+				require.NoError(t, file.Close())
+				t.Skip("this environment can read mode-000 files")
+			}
+			require.ErrorIs(t, err, os.ErrPermission)
+			emitter.mu.Lock()
+			emitter.scopes = nil
+			emitter.mu.Unlock()
+			metrics := &reconciliationRuntimeMetrics{}
+			ctx := context.WithValue(t.Context(), reconciliationMetricsContextKey{}, metrics)
+
+			require.ErrorContains(t, reconcile(ctx), "failed processing page: 1 failures")
+			requireGroupedChildParent(t, database, true,
+				"an unrelated unreadable source must not block the pending link")
+			assert.Equal(t, []string{"sessions"}, emitter.got())
+			if !grouped {
+				assert.Equal(t, 1, engine.LastReconciliationResult().Metrics.GlobalLinkPasses)
+			}
+			require.ErrorContains(t, reconcile(ctx), "failed processing page: 1 failures")
+			if grouped {
+				assert.Equal(t, 1, metrics.snapshot(ReconciliationMetrics{}).GlobalLinkPasses)
+			} else {
+				assert.Zero(t, engine.LastReconciliationResult().Metrics.GlobalLinkPasses)
+			}
+			assert.Equal(t, []string{"sessions"}, emitter.got(),
+				"the successful retry must not repeat while the unrelated failure persists")
+		})
+	}
+}
+
 func TestScopedParentRepairsReachSyncResults(t *testing.T) {
 	for _, mode := range []string{"watcher", "plan", "single session"} {
 		t.Run(mode, func(t *testing.T) {
