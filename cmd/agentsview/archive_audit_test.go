@@ -31,8 +31,9 @@ func TestArchiveAuditRetriesWithBackoffOnFailure(t *testing.T) {
 
 	attempts := 0
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, mode string, _ func(workerLine),
+		_ context.Context, _ config.Config, request syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		assert.Equal(t, "audit", mode)
 		attempts++
 		if attempts <= 6 {
@@ -93,8 +94,9 @@ func TestArchiveAuditPublishesAndClearsWorkerProgress(t *testing.T) {
 	}()
 	sentinel := errors.New("audit worker stopped")
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, mode string, onLine func(workerLine),
+		_ context.Context, _ config.Config, request syncWorkerRequest, onLine func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		assert.Equal(t, "audit", mode)
 		close(workerStarted)
 		<-emitProgress
@@ -160,7 +162,7 @@ func TestArchiveAuditEmitsOnDataChange(t *testing.T) {
 	em := &scopedEmitter{scopes: make(chan string, 1)}
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		return workerResult{Status: "ok", Synced: 2, DiscoveryComplete: true}, nil
 	})
@@ -188,8 +190,9 @@ func TestArchiveAuditReloadsParentSkipCacheAfterWorkerTombstones(t *testing.T) {
 	require.Contains(t, engine.SnapshotSkipCache(), hashKey)
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, workerCfg config.Config, mode string, _ func(workerLine),
+		_ context.Context, workerCfg config.Config, request syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		assert.Equal(t, "audit", mode)
 		workerDB, err := db.Open(t.Context(), workerCfg.DBPath)
 		require.NoError(t, err)
@@ -224,7 +227,7 @@ func TestArchiveAuditReloadsSkipCacheOnLostTerminalResult(t *testing.T) {
 	require.Contains(t, engine.SnapshotSkipCache(), hashKey)
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, workerCfg config.Config, _ string, _ func(workerLine),
+		_ context.Context, workerCfg config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		workerDB, err := db.Open(t.Context(), workerCfg.DBPath)
 		require.NoError(t, err)
@@ -254,7 +257,7 @@ func TestArchiveAuditEmitsOnPartialSuccess(t *testing.T) {
 	em := &scopedEmitter{scopes: make(chan string, 1)}
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		return workerResult{Status: "failed", Synced: 2, Failed: 1},
 			errors.New("audit worker pass reported failed")
@@ -282,7 +285,7 @@ func TestArchiveAuditSurfacesWorkerFailureWithoutFallback(t *testing.T) {
 	em := &scopedEmitter{scopes: make(chan string, 1)}
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		return workerResult{Status: "failed"}, errors.New("audit boom")
 	})
@@ -383,7 +386,7 @@ func TestArchiveAuditLoopStopsOnContextCancel(t *testing.T) {
 func TestSyncWorkerAuditModeRunsSyncPass(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "audit", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "audit"}, &out))
 	result := decodeSingleResult(t, &out)
 	assert.Equal(t, "ok", result.Status)
 	assert.True(t, result.DiscoveryComplete)
@@ -411,7 +414,7 @@ func TestSyncWorkerAuditMarksMissedSourceMissing(t *testing.T) {
 	require.NoError(t, os.Remove(deletedPath))
 
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "audit", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "audit"}, &out))
 	result := decodeSingleResult(t, &out)
 	assert.Equal(t, "ok", result.Status)
 	assert.Equal(t, 1, result.Tombstoned,

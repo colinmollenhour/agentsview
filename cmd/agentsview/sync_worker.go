@@ -56,11 +56,18 @@ type workerResult struct {
 	Stats *sync.SyncStats `json:"stats,omitempty"`
 }
 
+// syncWorkerRequest carries the pass and any unfinished linking owned by the
+// daemon. An audit must receive that state even when no source has changed.
+type syncWorkerRequest struct {
+	Mode         string
+	LinksPending bool
+}
+
 // newSyncWorkerCommand registers the hidden self-exec'd worker. The daemon runs
 // it as a short-lived child so archive-scale allocation high-water returns to
 // the OS when the child exits, instead of pinning the daemon's RSS.
 func newSyncWorkerCommand() *cobra.Command {
-	var mode string
+	var request syncWorkerRequest
 	cmd := &cobra.Command{
 		Use:          "sync-worker",
 		Short:        "Run one heavy sync pass and stream a terminal result",
@@ -80,13 +87,15 @@ func newSyncWorkerCommand() *cobra.Command {
 			// log.Printf diagnostics would otherwise flood the serve
 			// console instead of landing in the debug log.
 			setupLogFile(cfg.DataDir)
-			return runSyncWorker(cfg, mode, cmd.OutOrStdout())
+			return runSyncWorker(cfg, request, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(
-		&mode, "mode", "",
+		&request.Mode, "mode", "",
 		"worker mode: startup, sync, resync-build, audit",
 	)
+	cmd.Flags().BoolVar(&request.LinksPending, "links-pending", false,
+		"finish parent linking retained by the daemon")
 	if err := cmd.MarkFlagRequired("mode"); err != nil {
 		panic(err)
 	}
@@ -96,16 +105,17 @@ func newSyncWorkerCommand() *cobra.Command {
 }
 
 // runSyncWorker runs one worker pass with a background context.
-func runSyncWorker(cfg config.Config, mode string, out io.Writer) error {
-	return runSyncWorkerContext(context.Background(), cfg, mode, out)
+func runSyncWorker(cfg config.Config, request syncWorkerRequest, out io.Writer) error {
+	return runSyncWorkerContext(context.Background(), cfg, request, out)
 }
 
 // runSyncWorkerContext dispatches on mode, streaming NDJSON progress and exactly
 // one terminal result. It returns nil only when the terminal result is Status
 // "ok" with authoritative discovery; the child's exit code follows this error.
 func runSyncWorkerContext(
-	ctx context.Context, cfg config.Config, mode string, out io.Writer,
+	ctx context.Context, cfg config.Config, request syncWorkerRequest, out io.Writer,
 ) error {
+	mode := request.Mode
 	stopProfile := startSyncWorkerProfile(mode)
 	defer stopProfile()
 
@@ -135,7 +145,7 @@ func runSyncWorkerContext(
 		// they must refuse a stale-version archive rather than swap it out from
 		// under those readers; the real resync path is the resync-build flow,
 		// which swaps and resets caches daemon-side.
-		err = runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
+		err = runSyncWorkerStartup(ctx, cfg, request, emit, onProgress)
 	case "resync-build":
 		err = runSyncWorkerResyncBuild(ctx, cfg, mode, emit, onProgress)
 	default:
@@ -161,10 +171,11 @@ func runSyncWorkerContext(
 func runSyncWorkerStartup(
 	ctx context.Context,
 	cfg config.Config,
-	mode string,
+	request syncWorkerRequest,
 	emit func(workerLine),
 	onProgress func(sync.Progress),
 ) error {
+	mode := request.Mode
 	reportOpening := func(p db.OpenProgress) {
 		onProgress(sync.Progress{Phase: sync.PhaseOpeningDatabase, Detail: p.Detail, Resync: p.ResyncRequired})
 	}
@@ -185,6 +196,7 @@ func runSyncWorkerStartup(
 
 	engine := sync.NewEngine(ctx, database, workerEngineConfig(cfg))
 	defer engine.Close()
+	engine.RetainSubagentLinkRetry(request.LinksPending)
 
 	if database.NeedsResync() && mode != "startup" {
 		// A resync would CloseConnections + rename the archive file, but the

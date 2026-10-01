@@ -68,7 +68,7 @@ func requireWriteOwnerLockReleased(t *testing.T, dataDir, msg string) {
 func stubLaunchSyncWorker(
 	t *testing.T,
 	fn func(
-		context.Context, config.Config, string, func(workerLine),
+		context.Context, config.Config, syncWorkerRequest, func(workerLine),
 	) (workerResult, error),
 ) func() {
 	t.Helper()
@@ -108,7 +108,7 @@ func TestRunWorkerWritePassRecoversWriterWhenCloseFails(t *testing.T) {
 	restoreClose := stubCloseWriterFailure(t)
 	defer restoreClose()
 	restoreLaunch := stubLaunchSyncWorker(t, func(
-		context.Context, config.Config, string, func(workerLine),
+		context.Context, config.Config, syncWorkerRequest, func(workerLine),
 	) (workerResult, error) {
 		return workerResult{}, errors.New("worker must not launch after a failed writer close")
 	})
@@ -137,7 +137,7 @@ func TestRunWorkerResyncBuildRecoversWriterWhenCloseFails(t *testing.T) {
 	restoreClose := stubCloseWriterFailure(t)
 	defer restoreClose()
 	restoreLaunch := stubLaunchSyncWorker(t, func(
-		context.Context, config.Config, string, func(workerLine),
+		context.Context, config.Config, syncWorkerRequest, func(workerLine),
 	) (workerResult, error) {
 		return workerResult{}, errors.New("worker must not launch after a failed writer close")
 	})
@@ -162,8 +162,9 @@ func TestRunWorkerWritePassYieldsWriteOwnership(t *testing.T) {
 	defer engine.Close()
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, mode string, _ func(workerLine),
+		_ context.Context, _ config.Config, request syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		assert.Equal(t, "audit", mode)
 		requireWriteOwnerLockReleased(t, cfg.DataDir, "flock released before spawn")
 		return workerResult{Status: "ok", DiscoveryComplete: true}, nil
@@ -192,7 +193,7 @@ func TestRunWorkerWritePassReloadsSkipCacheBeforeReleasingLock(t *testing.T) {
 	require.Contains(t, engine.SnapshotSkipCache(), hashKey)
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, workerCfg config.Config, _ string, _ func(workerLine),
+		_ context.Context, workerCfg config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		// The worker durably deletes the entry, exactly like a tombstoning
 		// audit pass.
@@ -237,7 +238,7 @@ func TestRunWorkerWritePassKeepsSkipCacheOnSpawnFailure(t *testing.T) {
 	require.NoError(t, database.ReplaceSkippedFiles(t.Context(), map[string]int64{}))
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		return workerResult{}, fmt.Errorf("%w: starting process: boom", errWorkerSpawn)
 	})
@@ -260,7 +261,7 @@ func TestRunWorkerWritePassReacquiresOnWorkerFailure(t *testing.T) {
 
 	workerErr := errors.New("worker boom")
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		return workerResult{Status: "failed"}, workerErr
 	})
@@ -304,7 +305,7 @@ func TestRunWorkerWritePassRetriesReacquireUntilLockFree(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(originalLog) })
 	closeErr := make(chan error, 1)
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		// The daemon released the flock for the pass; a contender grabs it and
 		// holds it until the first reacquire failure is observed, then releases
@@ -347,8 +348,9 @@ func TestRunWorkerSyncPassRecordsSyncBookkeeping(t *testing.T) {
 		Warnings:       []string{"one warning"},
 	}
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, mode string, _ func(workerLine),
+		_ context.Context, _ config.Config, request syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		assert.Equal(t, "sync", mode)
 		return workerResult{
 			Status: "ok", Synced: 3, DiscoveryComplete: true,
@@ -405,7 +407,7 @@ func TestRunForegroundWorkerSyncPassRejectsBusyEngineBeforeWorkerLaunch(
 		require.FailNow(t, "first exclusive sync did not acquire the lock")
 	}
 	restore := stubLaunchSyncWorker(t, func(
-		context.Context, config.Config, string, func(workerLine),
+		context.Context, config.Config, syncWorkerRequest, func(workerLine),
 	) (workerResult, error) {
 		return workerResult{}, errors.New("busy foreground sync must not launch another worker")
 	})
@@ -437,7 +439,7 @@ func TestRunForegroundWorkerSyncPassPublishesAndClearsWorkerProgress(
 		}
 	}()
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, onLine func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, onLine func(workerLine),
 	) (workerResult, error) {
 		onLine(workerLine{Progress: &sync.Progress{
 			Phase: sync.PhaseSyncing, SessionsTotal: 4, SessionsDone: 1,
@@ -504,8 +506,9 @@ func TestRunWorkerResyncBuildPublishesAndClearsWorkerProgress(t *testing.T) {
 	}()
 	sentinel := errors.New("resync worker stopped")
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, mode string, onLine func(workerLine),
+		_ context.Context, _ config.Config, request syncWorkerRequest, onLine func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		assert.Equal(t, "resync-build", mode)
 		close(workerStarted)
 		<-emitProgress
@@ -621,7 +624,7 @@ func TestRunWorkerSyncPassNoWorkerRecordsNothing(t *testing.T) {
 				passLock = &writeOwnerLock{}
 			}
 			restoreLaunch := stubLaunchSyncWorker(t, func(
-				context.Context, config.Config, string, func(workerLine),
+				context.Context, config.Config, syncWorkerRequest, func(workerLine),
 			) (workerResult, error) {
 				if tt.failSpawn {
 					return workerResult{}, fmt.Errorf(
@@ -666,7 +669,7 @@ func TestRunWorkerSyncPassNoWorkerRecordsNothing(t *testing.T) {
 			restoreClose()
 			restoreLaunch()
 			restoreRetry := stubLaunchSyncWorker(t, func(
-				context.Context, config.Config, string, func(workerLine),
+				context.Context, config.Config, syncWorkerRequest, func(workerLine),
 			) (workerResult, error) {
 				return workerResult{Status: "ok", DiscoveryComplete: true}, nil
 			})
@@ -709,7 +712,7 @@ func TestRunWorkerSyncPassWorkerFailureStillRecords(t *testing.T) {
 
 	workerErr := errors.New("worker boom")
 	restore := stubLaunchSyncWorker(t, func(
-		context.Context, config.Config, string, func(workerLine),
+		context.Context, config.Config, syncWorkerRequest, func(workerLine),
 	) (workerResult, error) {
 		return workerResult{Status: "failed", Tombstoned: 1}, workerErr
 	})
@@ -789,7 +792,7 @@ func TestRunWorkerSyncPassLockHeldRecheckSkipsDuplicate(t *testing.T) {
 	launches := make(chan struct{}, 2)
 	release := make(chan struct{})
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		launches <- struct{}{}
 		<-release
@@ -867,7 +870,7 @@ func TestRunWorkerWritePassRecoversLockAfterRequestCancel(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(originalLog) })
 	closeErr := make(chan error, 1)
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		// The client disconnects mid-pass while a contender briefly holds the
 		// freed lock: recovery must still reacquire and reopen the writer.
@@ -1140,7 +1143,7 @@ func TestRunWorkerWritePassShutdownStopsPersistentRecovery(t *testing.T) {
 	defer shutdown()
 	var contender *writeOwnerLock
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, _ func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
 		// A contender takes the freed lock and never releases it, then the
 		// daemon shuts down while reacquisition is retrying.
@@ -1188,8 +1191,9 @@ func TestRunWorkerResyncBuildDropsTombstonesWhenSwapFailsBeforeInstall(
 	defer engine.Close()
 
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, mode string, _ func(workerLine),
+		_ context.Context, _ config.Config, request syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		assert.Equal(t, "resync-build", mode)
 		// Report a build that tombstoned a row but stage no replacement, so
 		// the daemon's swap fails at the rename with the original intact.
@@ -1241,8 +1245,9 @@ func TestWorkerResyncNotifiesInstalledRepairAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, c config.Config, mode string, _ func(workerLine),
+		_ context.Context, c config.Config, request syncWorkerRequest, _ func(workerLine),
 	) (workerResult, error) {
+		mode := request.Mode
 		var result workerResult
 		err := runSyncWorkerResyncBuild(t.Context(), c, mode, func(line workerLine) {
 			if line.Result != nil {

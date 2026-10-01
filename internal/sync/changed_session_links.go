@@ -14,7 +14,20 @@ type changedSessionLinks map[string]struct{}
 func (e *Engine) PendingSubagentLinks() bool {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
+	return e.PendingSubagentLinksExclusive()
+}
+
+// PendingSubagentLinksExclusive snapshots retry state for a worker handoff.
+// The caller holds syncMu.
+func (e *Engine) PendingSubagentLinksExclusive() bool {
 	return e.subagentLinkPending
+}
+
+// RetainSubagentLinkRetry adopts unfinished linking before reconciliation.
+func (e *Engine) RetainSubagentLinkRetry(pending bool) {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	e.RetainSubagentLinkRetryExclusive(pending)
 }
 
 // RetainSubagentLinkRetryExclusive retains a worker's unfinished linking without
@@ -24,8 +37,8 @@ func (e *Engine) RetainSubagentLinkRetryExclusive(pending bool) {
 }
 
 // SetSubagentLinkRetryExclusive adopts the retry state after a worker completes
-// archive-wide linking. Partial or unknown worker results must retain existing
-// retries instead. The caller holds syncMu.
+// archive-wide linking, including an audit that received the pending work.
+// Unknown worker results must retain existing retries. The caller holds syncMu.
 func (e *Engine) SetSubagentLinkRetryExclusive(pending bool) {
 	e.subagentLinkPending = pending
 }

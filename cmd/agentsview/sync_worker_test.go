@@ -72,7 +72,7 @@ func decodeSingleResult(t *testing.T, out *bytes.Buffer) workerResult {
 func TestSyncWorkerStartupModeSyncsAndEmitsTerminalResult(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "startup", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "startup"}, &out))
 
 	var results []workerResult
 	sawProgress := false
@@ -103,7 +103,7 @@ func TestSyncWorkerStartupModeSyncsAndEmitsTerminalResult(t *testing.T) {
 func TestSyncWorkerAuditModeForwardsReconciliationProgress(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "audit", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "audit"}, &out))
 
 	sawActiveProgress := false
 	sc := bufio.NewScanner(&out)
@@ -130,7 +130,7 @@ func TestSyncWorkerStartupUsesConfiguredSourceMachine(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "startup", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "startup"}, &out))
 	assert.Equal(t, "ok", decodeSingleResult(t, &out).Status)
 
 	database, err := db.OpenReadOnly(t.Context(), cfg.DBPath)
@@ -154,7 +154,7 @@ func TestSyncWorkerReportsAbortAsFailure(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel() // aborted before work starts
 			var out bytes.Buffer
-			err = runSyncWorkerContext(ctx, cfg, mode, &out)
+			err = runSyncWorkerContext(ctx, cfg, syncWorkerRequest{Mode: mode}, &out)
 			require.Error(t, err, "aborted work must not exit zero")
 			result := decodeSingleResult(t, &out)
 			assert.Equal(t, "aborted", result.Status)
@@ -170,7 +170,7 @@ func TestSyncWorkerResyncBuildReportsMissingArchive(t *testing.T) {
 		InstallationID: "0123456789abcdef0123456789abcdef",
 	}
 	var out bytes.Buffer
-	require.Error(t, runSyncWorkerContext(t.Context(), cfg, "resync-build", &out))
+	require.Error(t, runSyncWorkerContext(t.Context(), cfg, syncWorkerRequest{Mode: "resync-build"}, &out))
 	result := decodeSingleResult(t, &out)
 	assert.Equal(t, "failed", result.Status)
 	assert.False(t, result.DiscoveryComplete)
@@ -196,7 +196,7 @@ func TestSyncWorkerFailsWhenWriteLockHeld(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	holdWriteOwnerLockForTest(t, cfg.DataDir) // hold db.write.lock like a daemon
 	var out bytes.Buffer
-	err := runSyncWorker(cfg, "startup", &out)
+	err := runSyncWorker(cfg, syncWorkerRequest{Mode: "startup"}, &out)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "write lock")
 }
@@ -204,7 +204,7 @@ func TestSyncWorkerFailsWhenWriteLockHeld(t *testing.T) {
 func TestSyncWorkerRejectsUnknownMode(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	var out bytes.Buffer
-	err := runSyncWorker(cfg, "bogus", &out)
+	err := runSyncWorker(cfg, syncWorkerRequest{Mode: "bogus"}, &out)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "unknown sync-worker mode")
 }
@@ -221,7 +221,7 @@ func TestSyncWorkerResyncBuildModeBuildsReplacement(t *testing.T) {
 	require.NoError(t, database.Close())
 
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "resync-build", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "resync-build"}, &out))
 	result := decodeSingleResult(t, &out)
 	assert.Equal(t, "ok", result.Status)
 	assert.True(t, result.DiscoveryComplete)
@@ -254,7 +254,7 @@ func TestSyncWorkerResyncBuildUsesConfiguredImagePolicy(t *testing.T) {
 
 	cfg.ToolResultImages = config.ToolResultImagesDrop
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "resync-build", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "resync-build"}, &out))
 	require.Equal(t, "ok", decodeSingleResult(t, &out).Status)
 
 	replacement, err := db.Open(t.Context(), cfg.DBPath+"-resync")
@@ -306,7 +306,7 @@ func TestSyncWorkerResyncBuildAppliesClassifierConfig(t *testing.T) {
 	require.NoError(t, database.Close())
 
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "resync-build", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "resync-build"}, &out))
 	require.Equal(t, "ok", decodeSingleResult(t, &out).Status)
 
 	conn, err := sql.Open("sqlite3", cfg.DBPath+"-resync")
@@ -352,7 +352,7 @@ func TestSyncWorkerRefusesResyncForLiveArchiveModes(t *testing.T) {
 			require.NoError(t, err)
 
 			var out bytes.Buffer
-			err = runSyncWorkerContext(t.Context(), cfg, mode, &out)
+			err = runSyncWorkerContext(t.Context(), cfg, syncWorkerRequest{Mode: mode}, &out)
 			require.Error(t, err, "a live-archive worker must refuse a stale archive")
 			require.ErrorContains(t, err, "resync")
 
@@ -389,7 +389,7 @@ func (w *failOnResultWriter) Write(p []byte) (int, error) {
 func TestSyncWorkerNonZeroWhenTerminalResultWriteFails(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	w := &failOnResultWriter{}
-	err := runSyncWorkerContext(t.Context(), cfg, "startup", w)
+	err := runSyncWorkerContext(t.Context(), cfg, syncWorkerRequest{Mode: "startup"}, w)
 	require.Error(t, err, "a dropped terminal result must fail the worker")
 	assert.True(t, w.attempted, "the terminal result write was attempted")
 	assert.ErrorContains(t, err, "terminal result")
@@ -419,7 +419,7 @@ func TestSyncWorkerStartupAbortedResyncFallsBackIncremental(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "startup", &out),
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "startup"}, &out),
 		"the incremental fallback must complete the pass")
 	result := decodeSingleResult(t, &out)
 	assert.Equal(t, "ok", result.Status,
@@ -508,7 +508,7 @@ func TestResyncBuildResultFromStatsToleratesMinorityParseFailures(t *testing.T) 
 func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	var out bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, "sync", &out))
+	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "sync"}, &out))
 	result := decodeSingleResult(t, &out)
 	assert.Equal(t, "ok", result.Status)
 	assert.True(t, result.DiscoveryComplete)
@@ -533,7 +533,7 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 		{name: "audit retry", mode: "audit", failLink: true},
 		{name: "lost sync result", mode: "sync", failLink: true, loseResult: true},
 		{name: "sync completes pending links", mode: "sync", failLink: true, retryWithWorker: true},
-		{name: "unchanged audit retains pending links", mode: "audit", failLink: true, retryWithWorker: true, wantIdlePasses: 1},
+		{name: "unchanged audit completes pending links", mode: "audit", failLink: true, retryWithWorker: true},
 		{name: "installed rebuild completes pending links", mode: "resync-build", failLink: true, retryWithWorker: true},
 		{name: "installed rebuild with canceled cache reload", mode: "resync-build", failLink: true, retryWithWorker: true, cancelAfterBuild: true},
 		{name: "discarded rebuild retains pending links", mode: "resync-build", failLink: true, retryWithWorker: true, discardBuild: true, wantIdlePasses: 1},
@@ -541,7 +541,7 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfigWithClaudeFixture(t)
 			var initial bytes.Buffer
-			require.NoError(t, runSyncWorker(cfg, "startup", &initial))
+			require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "startup"}, &initial))
 			database, lock := openTestWriteDB(t, cfg)
 			for _, id := range []string{"worker-parent", "worker-child"} {
 				require.NoError(t, database.UpsertSession(t.Context(), db.Session{
@@ -583,10 +583,11 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 			defer cancel()
 			var terminal workerResult
 			restore := stubLaunchSyncWorker(t, func(
-				ctx context.Context, cfg config.Config, mode string, _ func(workerLine),
+				ctx context.Context, cfg config.Config, request syncWorkerRequest, _ func(workerLine),
 			) (workerResult, error) {
+				mode := request.Mode
 				var wire bytes.Buffer
-				workerErr := runSyncWorkerContext(ctx, cfg, mode, &wire)
+				workerErr := runSyncWorkerContext(ctx, cfg, request, &wire)
 				terminal = decodeSingleResult(t, &wire)
 				if mode == "resync-build" {
 					if tc.discardBuild {
@@ -647,7 +648,7 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 					child, err := database.GetSession(t.Context(), "worker-child")
 					require.NoError(t, err)
 					require.NotNil(t, child)
-					if tc.mode == "audit" || tc.discardBuild {
+					if tc.discardBuild {
 						require.Nil(t, child.ParentSessionID,
 							"the worker has not completed linking in the live archive")
 					} else {

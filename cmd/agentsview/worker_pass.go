@@ -276,9 +276,10 @@ func workerWritePassLocked(
 		)
 	}
 
-	result, workerErr := launchSyncWorker(ctx, cfg, mode, onLine)
+	request := syncWorkerRequest{Mode: mode, LinksPending: engine.PendingSubagentLinksExclusive()}
+	result, workerErr := launchSyncWorker(ctx, cfg, request, onLine)
 	if result.Stats != nil {
-		if mode == "sync" && workerErr == nil {
+		if (mode == "sync" || mode == "audit") && workerErr == nil {
 			engine.SetSubagentLinkRetryExclusive(result.Stats.LinksPending)
 		} else {
 			engine.RetainSubagentLinkRetryExclusive(result.Stats.LinksPending)
@@ -390,9 +391,10 @@ func reacquireWriteOwnerLock(
 func launchSyncWorkerProcess(
 	ctx context.Context,
 	cfg config.Config,
-	mode string,
+	request syncWorkerRequest,
 	onLine func(workerLine),
 ) (workerResult, error) {
+	mode := request.Mode
 	exe, err := os.Executable()
 	if err != nil {
 		return workerResult{}, fmt.Errorf(
@@ -400,7 +402,7 @@ func launchSyncWorkerProcess(
 		)
 	}
 
-	cmd := exec.CommandContext(ctx, exe, syncWorkerChildArgs(os.Args[1:], mode)...)
+	cmd := exec.CommandContext(ctx, exe, syncWorkerChildArgs(os.Args[1:], request)...)
 	// Config forwarding mirrors startServeBackgroundProcess: the child inherits
 	// the parent environment (per-agent dir overrides, AGENTSVIEW_* vars), plus
 	// the worker marker and the resolved data dir. syncWorkerChildArgs forwards
@@ -512,8 +514,11 @@ func readWorkerResult(
 // --background child. Re-emitting the parsed flags (rather than copying raw
 // tokens) drops serve-only lifecycle flags the worker does not accept and
 // normalizes every value to an unambiguous --name=value form.
-func syncWorkerChildArgs(parentArgs []string, mode string) []string {
-	args := []string{"sync-worker", "--mode", mode}
+func syncWorkerChildArgs(parentArgs []string, request syncWorkerRequest) []string {
+	args := []string{"sync-worker", "--mode", request.Mode}
+	if request.LinksPending {
+		args = append(args, "--links-pending")
+	}
 	fs := pflag.NewFlagSet("sync-worker-forward", pflag.ContinueOnError)
 	fs.ParseErrorsAllowlist.UnknownFlags = true
 	config.RegisterServePFlags(fs)

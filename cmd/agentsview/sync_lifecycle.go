@@ -27,6 +27,7 @@ func completeWorkerStartupReconciliation(
 	ctx context.Context,
 	roots []string,
 	workerStats syncpkg.SyncStats,
+	retainLinks func(bool),
 	reconcile func(context.Context, []string, bool) error,
 	queueRetry func(syncpkg.WatchBatch),
 	record func(syncpkg.SyncStats, error),
@@ -34,6 +35,10 @@ func completeWorkerStartupReconciliation(
 	started := time.Now()
 	log.Printf("startup gap reconciliation started: roots=%d", len(roots))
 
+	// Transfer unfinished links before the gap pass decides whether to link.
+	// Consume the carried flag so acknowledgment cannot rearm a completed repair.
+	retainLinks(workerStats.LinksPending)
+	workerStats.LinksPending = false
 	var gapErr error
 	if len(roots) > 0 {
 		gapErr = reconcile(ctx, roots, false)

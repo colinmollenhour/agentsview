@@ -382,6 +382,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 						ctx,
 						reconcileRootPaths(ingestion.Config()),
 						statsFromWorkerResult(workerStartupResult),
+						engine.RetainSubagentLinkRetry,
 						engine.ReconcileWatchRoots,
 						ingestion.QueueWatchRetry,
 						engine.RecordStartupReconciled,
@@ -791,7 +792,7 @@ func runStartupSyncViaWorker(
 		}
 		progress.SetDetail(startupProgressDetail(p))
 	}
-	result, err := launchSyncWorker(ctx, cfg, "startup", onLine)
+	result, err := launchSyncWorker(ctx, cfg, syncWorkerRequest{Mode: "startup"}, onLine)
 	if err == nil && result.Stats != nil {
 		printSyncSummary(*result.Stats, t)
 	} else if progressShown {
@@ -1194,7 +1195,7 @@ func runWorkerResyncBuild(
 		); cerr != nil {
 			return cerr
 		}
-		result, launchErr = launchSyncWorker(ctx, cfg, "resync-build", relay)
+		result, launchErr = launchSyncWorker(ctx, cfg, syncWorkerRequest{Mode: "resync-build"}, relay)
 		if launchErr != nil {
 			if result.Stats != nil {
 				result.Stats.LinksUpdated = 0

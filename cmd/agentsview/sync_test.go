@@ -78,7 +78,7 @@ func TestPreparedHTTPRebuildLeaseCLIForwardsCommitOnce(t *testing.T) {
 func TestStartupWorkerDoesNotAddBlankLineForNonTerminalProgress(t *testing.T) {
 	cfg := config.Config{DataDir: t.TempDir()}
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, onLine func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, onLine func(workerLine),
 	) (workerResult, error) {
 		onLine(workerLine{Progress: &agentsync.Progress{
 			Phase:         agentsync.PhaseSyncing,
