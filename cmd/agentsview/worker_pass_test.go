@@ -641,6 +641,7 @@ func TestRunWorkerSyncPassNoWorkerRecordsNothing(t *testing.T) {
 				require.ErrorContains(t, err, tt.wantErrText)
 			}
 			assert.False(t, ran, "no worker ran, so the pass must report ran=false")
+			assert.False(t, engine.PendingSubagentLinks(), "no worker ran to leave unfinished links")
 			assert.Equal(t, sync.SyncStats{}, stats,
 				"a pass without a worker must not synthesize stats")
 			assert.False(t, engine.StartupReconciled(),

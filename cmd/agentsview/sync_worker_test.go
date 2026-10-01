@@ -519,13 +519,15 @@ func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {
 // Only process creation is replaced, keeping both sides on temporary archives.
 func TestWorkerParentLinkHandoff(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		mode     string
-		failLink bool
+		name       string
+		mode       string
+		failLink   bool
+		loseResult bool
 	}{
 		{name: "sync repair", mode: "sync"},
 		{name: "sync retry", mode: "sync", failLink: true},
 		{name: "audit retry", mode: "audit", failLink: true},
+		{name: "lost sync result", mode: "sync", failLink: true, loseResult: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfigWithClaudeFixture(t)
@@ -575,6 +577,11 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 				var wire bytes.Buffer
 				workerErr := runSyncWorkerContext(ctx, cfg, mode, &wire)
 				terminal = decodeSingleResult(t, &wire)
+				if tc.loseResult {
+					// The worker has finished its writes, but the daemon receives
+					// no terminal line, as when cancellation kills a started worker.
+					return readWorkerResult(&bytes.Buffer{}, nil)
+				}
 				return terminal, workerErr
 			})
 			defer restore()
@@ -590,6 +597,9 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 			require.Zero(t, terminal.Stats.CwdUpdated)
 			if tc.failLink {
 				require.Error(t, err)
+				if tc.loseResult {
+					require.ErrorContains(t, err, "0 terminal results")
+				}
 				_, err = raw.ExecContext(t.Context(), `DROP TRIGGER fail_worker_link`)
 				require.NoError(t, err)
 				require.NoError(t, engine.ReconcileProviderRootsGrouped(t.Context(), []sync.ProviderRootsGroup{
@@ -606,6 +616,7 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 			require.NotNil(t, child)
 			assert.Equal(t, new("worker-parent"), child.ParentSessionID,
 				"the unchanged poll must finish links left by a failed worker")
+			assert.False(t, engine.PendingSubagentLinks(), "a successful retry must clear pending work")
 		})
 	}
 }

@@ -279,6 +279,10 @@ func workerWritePassLocked(
 	result, workerErr := launchSyncWorker(ctx, cfg, mode, onLine)
 	if result.Stats != nil {
 		engine.RetainSubagentLinkRetryExclusive(result.Stats.LinksPending)
+	} else if !workerNeverRan(workerErr) {
+		// A started worker may commit before losing its terminal result.
+		// Keep one linking pass pending when its completion is unknown.
+		engine.RetainSubagentLinkRetryExclusive(true)
 	}
 
 	// Lock recovery must not die with the caller's context: foreground
