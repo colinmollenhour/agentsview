@@ -524,6 +524,7 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 		failLink         bool
 		loseResult       bool
 		retryWithWorker  bool
+		failSource       bool
 		wantIdlePasses   int
 		discardBuild     bool
 		cancelAfterBuild bool
@@ -534,6 +535,8 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 		{name: "lost sync result", mode: "sync", failLink: true, loseResult: true},
 		{name: "sync completes pending links", mode: "sync", failLink: true, retryWithWorker: true},
 		{name: "unchanged audit completes pending links", mode: "audit", failLink: true, retryWithWorker: true},
+		{name: "failed sync completes pending links", mode: "sync", failLink: true, retryWithWorker: true, failSource: true},
+		{name: "failed audit completes pending links", mode: "audit", failLink: true, retryWithWorker: true, failSource: true},
 		{name: "installed rebuild completes pending links", mode: "resync-build", failLink: true, retryWithWorker: true},
 		{name: "installed rebuild with canceled cache reload", mode: "resync-build", failLink: true, retryWithWorker: true, cancelAfterBuild: true},
 		{name: "discarded rebuild retains pending links", mode: "resync-build", failLink: true, retryWithWorker: true, discardBuild: true, wantIdlePasses: 1},
@@ -624,6 +627,13 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 				require.NoError(t, err)
 				require.NoError(t, raw.Close())
 				if tc.retryWithWorker {
+					if tc.failSource {
+						root := t.TempDir()
+						cfg.AgentDirs[parser.AgentGemini] = []string{root}
+						path := filepath.Join(root, "tmp", "project", "chats", "session-broken.json")
+						require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+						require.NoError(t, os.WriteFile(path, []byte(`{"messages": invalid}`), 0o600))
+					}
 					switch tc.mode {
 					case "sync":
 						_, _, err = runWorkerSyncPass(ctx, t.Context(), cfg, engine, database, lock, false, nil)
@@ -633,6 +643,11 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 						_, err, _ = runWorkerResyncBuild(ctx, t.Context(), cfg, engine, database, nil)
 					}
 					switch {
+					case tc.failSource:
+						require.Error(t, err)
+						require.Positive(t, terminal.Failed)
+						require.Equal(t, 1, terminal.Stats.LinksUpdated,
+							"source failure must not hide the completed repair")
 					case tc.discardBuild:
 						require.ErrorContains(t, err, "swap resync database")
 					case tc.cancelAfterBuild:

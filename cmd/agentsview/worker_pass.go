@@ -279,7 +279,7 @@ func workerWritePassLocked(
 	request := syncWorkerRequest{Mode: mode, LinksPending: engine.PendingSubagentLinksExclusive()}
 	result, workerErr := launchSyncWorker(ctx, cfg, request, onLine)
 	if result.Stats != nil {
-		if (mode == "sync" || mode == "audit") && workerErr == nil {
+		if (mode == "sync" || mode == "audit") && result.LinkStateKnown {
 			engine.SetSubagentLinkRetryExclusive(result.Stats.LinksPending)
 		} else {
 			engine.RetainSubagentLinkRetryExclusive(result.Stats.LinksPending)
@@ -467,11 +467,17 @@ func collectWorkerResult(
 // malformed line, or a result count other than one, is a protocol error.
 func readWorkerResult(
 	r io.Reader, onLine func(workerLine),
-) (workerResult, error) {
+) (result workerResult, err error) {
+	defer func() {
+		if err != nil {
+			// Partial counters can still report committed writes, but an invalid
+			// result must not acknowledge completion of the daemon's pending links.
+			result.LinkStateKnown = false
+		}
+	}()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), workerLineMaxBytes)
 
-	var result workerResult
 	resultCount, malformed := 0, 0
 	for sc.Scan() {
 		raw := sc.Bytes()

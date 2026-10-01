@@ -925,12 +925,14 @@ func TestReadWorkerResultRequiresExactlyOneResult(t *testing.T) {
 		input     string
 		wantErr   string
 		wantLines int
+		wantKnown bool
 	}{
 		{
 			name: "single result",
 			input: `{"progress":{"phase":"syncing"}}` + "\n" +
-				`{"result":{"status":"ok","discoveryComplete":true}}` + "\n",
+				`{"result":{"status":"ok","discoveryComplete":true,"linkStateKnown":true}}` + "\n",
 			wantLines: 2,
+			wantKnown: true,
 		},
 		{
 			name:      "zero results is a protocol failure",
@@ -940,16 +942,23 @@ func TestReadWorkerResultRequiresExactlyOneResult(t *testing.T) {
 		},
 		{
 			name: "duplicate results is a protocol failure",
-			input: `{"result":{"status":"ok","discoveryComplete":true}}` + "\n" +
-				`{"result":{"status":"ok","discoveryComplete":true}}` + "\n",
+			input: `{"result":{"status":"ok","discoveryComplete":true,"linkStateKnown":true}}` + "\n" +
+				`{"result":{"status":"ok","discoveryComplete":true,"linkStateKnown":true}}` + "\n",
 			wantErr:   "2 terminal results",
 			wantLines: 2,
 		},
 		{
 			name: "malformed line is a protocol failure",
 			input: "not json\n" +
-				`{"result":{"status":"ok","discoveryComplete":true}}` + "\n",
+				`{"result":{"status":"ok","discoveryComplete":true,"linkStateKnown":true}}` + "\n",
 			wantErr:   "malformed",
+			wantLines: 1,
+		},
+		{
+			name: "read error after result cannot acknowledge links",
+			input: `{"result":{"status":"ok","discoveryComplete":true,"linkStateKnown":true}}` + "\n" +
+				strings.Repeat("x", workerLineMaxBytes+1),
+			wantErr:   "token too long",
 			wantLines: 1,
 		},
 	}
@@ -961,6 +970,8 @@ func TestReadWorkerResultRequiresExactlyOneResult(t *testing.T) {
 				func(workerLine) { seen++ },
 			)
 			assert.Equal(t, tt.wantLines, seen, "forwarded line count")
+			assert.Equal(t, tt.wantKnown, result.LinkStateKnown,
+				"only a valid terminal result may acknowledge link state")
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -971,6 +982,32 @@ func TestReadWorkerResultRequiresExactlyOneResult(t *testing.T) {
 			assert.True(t, result.DiscoveryComplete)
 		})
 	}
+}
+
+func TestWorkerHandoffRetainsLinksWhenWorkerCannotStartSync(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	database, lock := openTestWriteDB(t, cfg)
+	engine := sync.NewEngine(t.Context(), database, workerEngineConfig(cfg))
+	defer engine.Close()
+	engine.RetainSubagentLinkRetry(true)
+	restore := stubLaunchSyncWorker(t, func(
+		ctx context.Context, cfg config.Config, request syncWorkerRequest, _ func(workerLine),
+	) (workerResult, error) {
+		ctx, cancel := context.WithCancel(ctx)
+		cancel()
+		var wire bytes.Buffer
+		workerErr := runSyncWorkerContext(ctx, cfg, request, &wire)
+		require.Error(t, workerErr)
+		result, err := readWorkerResult(&wire, nil)
+		require.NoError(t, err)
+		require.NotNil(t, result.Stats, "early failure still carries synthetic stats")
+		require.False(t, result.Stats.LinksPending)
+		return result, workerErr
+	})
+	defer restore()
+	_, err := runWorkerWritePass(t.Context(), t.Context(), cfg, engine, database, lock, "audit", nil)
+	require.Error(t, err)
+	assert.True(t, engine.PendingSubagentLinks(), "synthetic failure stats cannot clear unfinished repairs")
 }
 
 // TestOversizedWorkerOutputHelperProcess is the re-exec target for the

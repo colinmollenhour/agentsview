@@ -54,6 +54,9 @@ type workerResult struct {
 	// (total sessions, orphan counts, warnings, anomalies). The summary
 	// counters above remain the authoritative status inputs.
 	Stats *sync.SyncStats `json:"stats,omitempty"`
+	// LinkStateKnown marks an engine snapshot of Stats.LinksPending, even when
+	// unrelated source failures make the pass fail. Early failures lack it.
+	LinkStateKnown bool `json:"linkStateKnown,omitempty"`
 }
 
 // syncWorkerRequest carries the pass and any unfinished linking owned by the
@@ -250,6 +253,7 @@ func runSyncWorkerStartup(
 	}
 
 	result.Stats.LinksPending = engine.PendingSubagentLinks()
+	result.LinkStateKnown = true
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
 		return fmt.Errorf("sync worker %s: %s", mode, result.Status)

@@ -238,10 +238,11 @@ During polling, changes to working-directory metadata refresh clients without
 triggering global parent linking. Worker processes return link repairs and
 unfinished linking to the daemon, so clients see repaired links and later polls
 retry failed linking even when an unrelated source cannot be processed.
-Completed full worker syncs and installed rebuilds clear obsolete link retries.
-Audit workers receive pending links from the daemon and clear the retry after
-repair, even when sources are unchanged. If a started worker loses its result,
-the daemon keeps a link retry pending. Startup transfers pending links before
+Workers confirm their link state separately from source errors, so completed
+repairs clear obsolete retries even when another source fails. Installed
+rebuilds also clear completed retries. Audit workers receive pending links from
+the daemon even when sources are unchanged. Missing or invalid worker results
+keep the retry pending. Startup transfers pending links before
 reconciling the worker-to-watcher gap. Repairs queued in the archive run even
 when discovery finds no source files. Repairs committed to the live archive
 refresh clients even if sync is canceled. Full resync aborts before replacing
