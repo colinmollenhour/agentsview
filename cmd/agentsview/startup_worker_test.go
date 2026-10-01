@@ -422,6 +422,73 @@ func TestStartupWorkerRanFailedSurfacedWithoutResync(t *testing.T) {
 	}
 }
 
+func TestStartupWorkerLostResultRetriesParentLinks(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	var initial bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "startup", &initial))
+	seeded := dbtest.OpenTestDBAt(t, cfg.DBPath)
+	for _, id := range []string{"startup-parent", "startup-child"} {
+		require.NoError(t, seeded.UpsertSession(t.Context(), db.Session{
+			ID: id, Agent: "zencoder", Project: "project", Machine: "local",
+			RelationshipType: "continuation",
+		}))
+	}
+	require.NoError(t, seeded.InsertMessages(t.Context(), []db.Message{{
+		SessionID: "startup-parent", Ordinal: 0, Role: "assistant", Content: "spawn child",
+		HasToolUse: true, ToolCalls: []db.ToolCall{{
+			ToolUseID: "spawn", ToolName: "Task", SubagentSessionID: "startup-child",
+		}},
+	}}))
+	require.NoError(t, seeded.Close())
+	raw, err := sql.Open("sqlite3", cfg.DBPath)
+	require.NoError(t, err)
+	defer raw.Close()
+	_, err = raw.ExecContext(t.Context(), `CREATE TRIGGER fail_startup_link
+		BEFORE UPDATE OF parent_session_id ON sessions WHEN NEW.id = 'startup-child'
+		BEGIN SELECT RAISE(FAIL, 'injected startup link failure'); END`)
+	require.NoError(t, err)
+	restore := stubLaunchSyncWorker(t, func(
+		ctx context.Context, cfg config.Config, mode string, _ func(workerLine),
+	) (workerResult, error) {
+		require.Equal(t, "startup", mode)
+		var wire bytes.Buffer
+		require.Error(t, runSyncWorkerContext(ctx, cfg, mode, &wire))
+		require.True(t, statsFromWorkerResult(decodeSingleResult(t, &wire)).LinksPending)
+		// Losing the terminal record also loses its pending-link flag. The
+		// daemon must recover even without the worker's failure details.
+		return readWorkerResult(&bytes.Buffer{}, nil)
+	})
+	defer restore()
+	result, workerErr := runStartupSyncViaWorker(t.Context(), cfg, newStartupStateWriter(cfg.DataDir, time.Now))
+	require.ErrorContains(t, workerErr, "0 terminal results")
+	carried, done := startupWorkerOutcome(result, workerErr)
+	require.True(t, done)
+	_, err = raw.ExecContext(t.Context(), `DROP TRIGGER fail_startup_link`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
+	engine := syncpkg.NewEngine(t.Context(), database, workerEngineConfig(cfg))
+	defer engine.Close()
+	child, err := database.GetSession(t.Context(), "startup-child")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.Nil(t, child.ParentSessionID)
+	completeWorkerStartupReconciliation(t.Context(), reconcileRootPaths(cfg), statsFromWorkerResult(carried),
+		engine.ReconcileWatchRoots, func(syncpkg.WatchBatch) { assert.Fail(t, "unchanged gap should succeed") },
+		engine.RecordStartupReconciled)
+	stats, _, err := engine.ReconcileWatchRootsWithStats(t.Context(), reconcileRootPaths(cfg), false, nil)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Synced, "recovery must repair links without a source change")
+	child, err = database.GetSession(t.Context(), "startup-child")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	assert.Equal(t, new("startup-parent"), child.ParentSessionID)
+	assert.Equal(t, 1, stats.LinksUpdated)
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), reconcileRootPaths(cfg), false))
+	assert.Zero(t, engine.LastReconciliationResult().Metrics.GlobalLinkPasses,
+		"the successful repair must not cause repeated idle linking")
+}
+
 func TestStatsFromWorkerResultMapsDiscoveryOntoAborted(t *testing.T) {
 	complete := statsFromWorkerResult(workerResult{
 		Status: "ok", Synced: 5, Skipped: 1, Failed: 0, DiscoveryComplete: true,

@@ -824,6 +824,12 @@ func startupWorkerOutcome(result workerResult, err error) (workerResult, bool) {
 			result.Status = "aborted"
 		}
 		result.DiscoveryComplete = false
+		if result.Stats == nil {
+			// The worker may have committed sessions before losing its result.
+			// Keep linking pending for recovery even when sources are unchanged.
+			result.Stats = new(statsFromWorkerResult(result))
+			result.Stats.LinksPending = true
+		}
 		return result, true
 	}
 }

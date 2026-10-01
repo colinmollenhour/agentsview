@@ -239,12 +239,12 @@ triggering global parent linking. Worker processes return link repairs and
 unfinished linking to the daemon, so clients see repaired links and later polls
 retry failed linking even when an unrelated source cannot be processed.
 Completed full worker syncs and installed rebuilds clear obsolete link retries;
-partial passes preserve them. If a started worker loses its result, the daemon
-keeps a link retry pending. Repairs queued in the archive run even when
-discovery finds no source files. Repairs committed to the live archive refresh
-clients even if sync is canceled. Full resync aborts before replacing the
-archive if relinking copied sessions fails; discarded replacements do not report
-their repairs and preserve pending retries for the live archive.
+partial passes preserve them. If a started worker loses its result, including
+during startup, the daemon keeps a link retry pending. Repairs queued in the
+archive run even when discovery finds no source files. Repairs committed to the
+live archive refresh clients even if sync is canceled. Full resync aborts before
+replacing the archive if relinking copied sessions fails; discarded replacements
+do not report their repairs and preserve pending retries for the live archive.
 
 Unchanged broken or missing source files are skipped through the failure cache
 described in [Sync Behavior](configuration.md#sync-behavior). Grok
