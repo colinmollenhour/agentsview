@@ -1209,6 +1209,9 @@ func runWorkerResyncBuild(
 		if installed {
 			doneStats = statsFromWorkerResult(result)
 			doneStats.ArchiveRebuilt = true
+			if result.Stats != nil {
+				engine.SetSubagentLinkRetryExclusive(doneStats.LinksPending)
+			}
 			// Record installed changes even when later recovery fails. The
 			// completion notification runs after releasing the exclusive lock.
 			defer func() {

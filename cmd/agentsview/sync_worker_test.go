@@ -519,15 +519,24 @@ func TestSyncWorkerSyncModeSyncsLikeStartup(t *testing.T) {
 // Only process creation is replaced, keeping both sides on temporary archives.
 func TestWorkerParentLinkHandoff(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		mode       string
-		failLink   bool
-		loseResult bool
+		name             string
+		mode             string
+		failLink         bool
+		loseResult       bool
+		retryWithWorker  bool
+		wantIdlePasses   int
+		discardBuild     bool
+		cancelAfterBuild bool
 	}{
 		{name: "sync repair", mode: "sync"},
 		{name: "sync retry", mode: "sync", failLink: true},
 		{name: "audit retry", mode: "audit", failLink: true},
 		{name: "lost sync result", mode: "sync", failLink: true, loseResult: true},
+		{name: "sync completes pending links", mode: "sync", failLink: true, retryWithWorker: true},
+		{name: "unchanged audit retains pending links", mode: "audit", failLink: true, retryWithWorker: true, wantIdlePasses: 1},
+		{name: "installed rebuild completes pending links", mode: "resync-build", failLink: true, retryWithWorker: true},
+		{name: "installed rebuild with canceled cache reload", mode: "resync-build", failLink: true, retryWithWorker: true, cancelAfterBuild: true},
+		{name: "discarded rebuild retains pending links", mode: "resync-build", failLink: true, retryWithWorker: true, discardBuild: true, wantIdlePasses: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfigWithClaudeFixture(t)
@@ -570,6 +579,8 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 			engineConfig.Emitter = em
 			engine := sync.NewEngine(t.Context(), database, engineConfig)
 			defer engine.Close()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
 			var terminal workerResult
 			restore := stubLaunchSyncWorker(t, func(
 				ctx context.Context, cfg config.Config, mode string, _ func(workerLine),
@@ -577,6 +588,14 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 				var wire bytes.Buffer
 				workerErr := runSyncWorkerContext(ctx, cfg, mode, &wire)
 				terminal = decodeSingleResult(t, &wire)
+				if mode == "resync-build" {
+					if tc.discardBuild {
+						require.NoError(t, os.Remove(engine.ResyncTempPath()))
+					}
+					if tc.cancelAfterBuild {
+						cancel()
+					}
+				}
 				if tc.loseResult {
 					// The worker has finished its writes, but the daemon receives
 					// no terminal line, as when cancellation kills a started worker.
@@ -585,7 +604,7 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 				return terminal, workerErr
 			})
 			defer restore()
-			if tc.mode == "sync" {
+			if tc.mode != "audit" {
 				_, _, err = runWorkerSyncPass(t.Context(), t.Context(), cfg, engine, database, lock, false, nil)
 				require.Zero(t, terminal.Synced)
 			} else {
@@ -602,9 +621,46 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 				}
 				_, err = raw.ExecContext(t.Context(), `DROP TRIGGER fail_worker_link`)
 				require.NoError(t, err)
-				require.NoError(t, engine.ReconcileProviderRootsGrouped(t.Context(), []sync.ProviderRootsGroup{
-					{Agent: parser.AgentClaude, Roots: cfg.AgentDirs[parser.AgentClaude]},
-				}))
+				if tc.retryWithWorker {
+					switch tc.mode {
+					case "sync":
+						_, _, err = runWorkerSyncPass(ctx, t.Context(), cfg, engine, database, lock, false, nil)
+					case "audit":
+						err = runArchiveAudit(ctx, cfg, engine, database, lock, em)
+					case "resync-build":
+						_, err, _ = runWorkerResyncBuild(ctx, t.Context(), cfg, engine, database, nil)
+					}
+					switch {
+					case tc.discardBuild:
+						require.ErrorContains(t, err, "swap resync database")
+					case tc.cancelAfterBuild:
+						require.ErrorIs(t, err, context.Canceled)
+						require.ErrorContains(t, err, "reloading skip cache after swap")
+					default:
+						require.NoError(t, err)
+					}
+					if tc.mode != "resync-build" {
+						require.Zero(t, terminal.Synced)
+					}
+					require.False(t, terminal.Stats.LinksPending)
+					child, err := database.GetSession(t.Context(), "worker-child")
+					require.NoError(t, err)
+					require.NotNil(t, child)
+					if tc.mode == "audit" || tc.discardBuild {
+						require.Nil(t, child.ParentSessionID,
+							"the worker has not completed linking in the live archive")
+					} else {
+						require.Equal(t, new("worker-parent"), child.ParentSessionID)
+					}
+					require.NoError(t, engine.ReconcileProviderRoots(t.Context(),
+						parser.AgentClaude, cfg.AgentDirs[parser.AgentClaude]))
+					assert.Equal(t, tc.wantIdlePasses, engine.LastReconciliationResult().Metrics.GlobalLinkPasses,
+						"only unfinished linking should require an idle global pass")
+				} else {
+					require.NoError(t, engine.ReconcileProviderRootsGrouped(t.Context(), []sync.ProviderRootsGroup{
+						{Agent: parser.AgentClaude, Roots: cfg.AgentDirs[parser.AgentClaude]},
+					}))
+				}
 			} else {
 				require.NoError(t, err)
 				assert.Equal(t, 1, statsFromWorkerResult(terminal).LinksUpdated)

@@ -23,6 +23,13 @@ func (e *Engine) RetainSubagentLinkRetryExclusive(pending bool) {
 	e.subagentLinkPending = e.subagentLinkPending || pending
 }
 
+// SetSubagentLinkRetryExclusive adopts the retry state after a worker completes
+// archive-wide linking. Partial or unknown worker results must retain existing
+// retries instead. The caller holds syncMu.
+func (e *Engine) SetSubagentLinkRetryExclusive(pending bool) {
+	e.subagentLinkPending = pending
+}
+
 func (ids changedSessionLinks) observe(job syncJob, prefix string) {
 	if job.incremental != nil {
 		ids[job.incremental.sessionID] = struct{}{}
