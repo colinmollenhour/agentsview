@@ -621,6 +621,7 @@ func TestWorkerParentLinkHandoff(t *testing.T) {
 				}
 				_, err = raw.ExecContext(t.Context(), `DROP TRIGGER fail_worker_link`)
 				require.NoError(t, err)
+				require.NoError(t, raw.Close())
 				if tc.retryWithWorker {
 					switch tc.mode {
 					case "sync":

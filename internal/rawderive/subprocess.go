@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json/v2"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"testing"
 	"time"
 
 	"go.kenn.io/agentsview/internal/parser"
@@ -277,6 +279,9 @@ func runParserProcess(ctx context.Context, cancel context.CancelFunc, cmd *exec.
 		return nil, ctx.Err()
 	}
 	if waitErr != nil {
+		if testing.Testing() {
+			fmt.Fprintf(os.Stderr, "isolated parser child failed: %v\nstderr: %s\n", waitErr, diagnostic.data.Bytes())
+		}
 		return nil, errParserFailed
 	}
 	if !bytes.HasPrefix(out.data.Bytes(), []byte("READY\n")) {
